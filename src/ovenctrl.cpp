@@ -7,7 +7,7 @@
 const char* wifi_sta_ssid = "gewifon";
 const char* wifi_sta_password = "wifi-pass";
 
-const char* wifi_ap_ssid = "Pizza Oven";
+const char* wifi_ap_ssid = "Pizza Control";
 const char* wifi_ap_pass = "sWEE3hFoUGzn";
 
 const char* dnsName = "pizza";        // Domain name for the mDNS responder
@@ -64,7 +64,9 @@ void wifi_event(WiFiEvent_t event) {
     Serial.printf("[WiFi-event] event: %d\n", event);
 
     switch (event) {
-    case SYSTEM_EVENT_STA_CONNECTED: Serial.println("WiFi connected"); break;
+    case SYSTEM_EVENT_STA_CONNECTED:
+        Serial.println("WiFi connected");
+        break;
 
     case SYSTEM_EVENT_STA_GOT_IP:
         Serial.println("WiFi IP address: ");
@@ -88,10 +90,25 @@ void wifi_setup() {
     Serial.print(wifi_ap_ssid);
     Serial.println("\" started\r\n");
 
-    // start async wifi station
+    // enable async wifi station
     WiFi.onEvent(wifi_event);
+}
 
-    WiFi.begin(wifi_sta_ssid, wifi_sta_password);
+void wifi_poll(unsigned long now) {
+    static long ts_check = 0;
+
+    if (ts_check < now) {
+        if (WiFi.status() != WL_CONNECTED) {
+            WiFi.disconnect();
+
+            // start async wifi connect
+            WiFi.begin(wifi_sta_ssid, wifi_sta_password);
+
+            Serial.print("Wifi: connecting to ");
+            Serial.println(wifi_sta_ssid);
+        }
+        ts_check = now + 10000;
+    }
 }
 
 void mdns_setup() { // Start the mDNS responder
@@ -115,13 +132,26 @@ const int spi_cs1_pin = 17;
 MAX6675_Thermocouple thermocouple0(spi_sck_pin, spi_cs0_pin, spi_so_pin);
 MAX6675_Thermocouple thermocouple1(spi_sck_pin, spi_cs1_pin, spi_so_pin);
 
-double temp0 = 0.0;
-double temp1 = 0.0;
+volatile double temp0 = 0.0;
+volatile double temp1 = 0.0;
+volatile float temp_esp = 0.0;
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// ESP internal temperature
+float temperatureRead();
+
+#ifdef __cplusplus
+}
+#endif
 
 void temp_main(void*) {
     while (true) {
-        temp0 = thermocouple0.readCelsius();
-        temp1 = thermocouple1.readCelsius();
+        // temp0 = thermocouple0.readCelsius();
+        // temp1 = thermocouple1.readCelsius();
+        temp_esp = temperatureRead();
 
         vTaskDelay(500 / portTICK_PERIOD_MS);
     }
@@ -153,32 +183,41 @@ volatile unsigned isr_last_ts = 0;
 
 const int max_temp = 900;
 
+static inline void on_target_temp_up(volatile unsigned& temp) {
+    if (temp + 25 < max_temp)
+        temp += 25;
+    else
+        temp = max_temp;
+}
+static inline void on_target_temp_down(volatile unsigned& temp) {
+    if (temp >= 25)
+        temp -= 25;
+    else
+        temp = 0;
+}
+
 void IRAM_ATTR on_button_up0() {
     if (isr_last_ts != isr_ts) {
-        if (target_temp0 < max_temp)
-            target_temp0 += 25;
+        on_target_temp_up(target_temp0);
         isr_last_ts = isr_ts;
     }
 }
 void IRAM_ATTR on_button_down0() {
     if (isr_last_ts != isr_ts) {
-        if (target_temp0 >= 25)
-            target_temp0 -= 25;
+        on_target_temp_down(target_temp0);
         isr_last_ts = isr_ts;
     }
 }
 
 void IRAM_ATTR on_button_up1() {
     if (isr_last_ts != isr_ts) {
-        if (target_temp1 < max_temp)
-            target_temp1 += 25;
+        on_target_temp_up(target_temp1);
         isr_last_ts = isr_ts;
     }
 }
 void IRAM_ATTR on_button_down1() {
     if (isr_last_ts != isr_ts) {
-        if (target_temp1 >= 25)
-            target_temp1 -= 25;
+        on_target_temp_down(target_temp1);
         isr_last_ts = isr_ts;
     }
 }
@@ -188,20 +227,16 @@ void buttons_main(void*) {
         isr_ts = millis();
 
         if (digitalRead(button_up0_pin) == LOW) {
-            if (target_temp0 < max_temp)
-                target_temp0 += 25;
+            on_target_temp_up(target_temp0);
         }
         if (digitalRead(button_down0_pin) == LOW) {
-            if (target_temp0 >= 25)
-                target_temp0 -= 25;
+            on_target_temp_down(target_temp0);
         }
         if (digitalRead(button_up1_pin) == LOW) {
-            if (target_temp1 < max_temp)
-                target_temp1 += 25;
+            on_target_temp_up(target_temp1);
         }
         if (digitalRead(button_down1_pin) == LOW) {
-            if (target_temp1 >= 25)
-                target_temp1 -= 25;
+            on_target_temp_down(target_temp1);
         }
 
         digitalWrite(16, digitalRead(button_up0_pin));
@@ -250,21 +285,55 @@ const int opto1_pin = 25;
 volatile bool opto0_state = false;
 volatile bool opto1_state = false;
 
-void IRAM_ATTR on_opto0() {
-    opto0_state = digitalRead(opto0_pin);
-}
-void IRAM_ATTR on_opto1() {
-    opto1_state = digitalRead(opto1_pin);
-}
+void IRAM_ATTR on_opto0() { opto0_state = digitalRead(opto0_pin); }
+void IRAM_ATTR on_opto1() { opto1_state = digitalRead(opto1_pin); }
 
 void opto_setup() {
     pinMode(opto0_pin, INPUT_PULLUP);
     pinMode(opto1_pin, INPUT_PULLUP);
 
-    attachInterrupt(
-        digitalPinToInterrupt(opto0_pin), on_opto0, CHANGE);
-    attachInterrupt(
-        digitalPinToInterrupt(opto1_pin), on_opto1, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(opto0_pin), on_opto0, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(opto1_pin), on_opto1, CHANGE);
+}
+
+/******************************************************************************/
+// PID Controller
+
+#include <PID_v1.h>
+
+// Specify the initial tuning parameters
+double pid_Kp = 2, pid_Ki = 5, pid_Kd = 1;
+
+double pid_input0 = temp0;
+double pid_target0 = target_temp0;
+double pid_output0;
+
+PID pid0(
+    &pid_input0, &pid_output0, &pid_target0, pid_Kp, pid_Ki, pid_Kd, DIRECT);
+
+void pid_setup() {
+    // turn the PID on
+    pid0.SetMode(AUTOMATIC);
+}
+
+double speed = 60.0;
+
+void pid_poll() {
+    // ofen simulator
+    temp0 += pid_output0 / 255.0 * 0.3 * speed;
+    temp0 -= 0.012 * speed;
+    if (random(32) < 8)
+        temp0 -= 40;
+
+    pid_input0 = temp0;
+    pid_target0 = target_temp0;
+
+    pid0.Compute();
+
+    Serial.print("temp: ");
+    Serial.print(temp0);
+    Serial.print("pid: ");
+    Serial.println(pid_output0);
 }
 
 /******************************************************************************/
@@ -272,6 +341,10 @@ void opto_setup() {
 
 #include <PubSubClient.h>
 #include <WiFiClientSecure.h>
+
+const char* mqtt_id = "pizza_control";
+const char* mqtt_user = "pizza";
+const char* mqtt_passwd = "IjvQYJ6XBd5m";
 
 const char* mqtt_ca_cert =
     "-----BEGIN CERTIFICATE-----\n"
@@ -306,16 +379,8 @@ const char* mqtt_ca_cert =
 WiFiClientSecure mqtt_wifi_client;
 PubSubClient mqtt_client(mqtt_wifi_client);
 
-void mqtt_callback(char* topic, byte* payload, unsigned int length) {
-    Serial.print("Message received: ");
-    Serial.println(topic);
-
-    Serial.print("payload: ");
-    for (int i = 0; i < length; i++) {
-        Serial.print((char)payload[i]);
-    }
-    Serial.println();
-}
+void mqtt_callback(char* topic, byte* payload, unsigned int length);
+void mqtt_subscribe();
 
 void mqtt_setup() {
     /* set SSL/TLS certificate */
@@ -326,25 +391,26 @@ void mqtt_setup() {
     mqtt_client.setCallback(mqtt_callback);
 }
 
-void mqtt_connect() {
+void mqtt_connect(unsigned long now) {
     if (WiFi.status() != WL_CONNECTED)
         return;
 
+    static unsigned long last_check = 0;
+    if (now < last_check)
+        return;
+    last_check = now + 5000;
+
     Serial.print("MQTT connecting ...");
-    /* mqtt_client ID */
-    String clientId = "pizza-control";
     /* connect now */
-    if (mqtt_client.connect(clientId.c_str())) {
+    if (mqtt_client.connect(mqtt_id, mqtt_user, mqtt_passwd)) {
         Serial.println("connected");
-        /* subscribe topic */
-        // mqtt_client.subscribe(led_topic);
+        /* subscribe topics */
+        mqtt_subscribe();
     }
     else {
         Serial.print("failed, status code =");
         Serial.print(mqtt_client.state());
         Serial.println("try again in 5 seconds");
-        /* Wait 5 seconds before retrying */
-        delay(5000);
     }
 }
 
@@ -364,8 +430,9 @@ void lcd_main(void*) {
         if (xtemp0 >= 10000)
             xtemp0 = 9999;
 
-        snprintf(buffer, sizeof(buffer), "%4u C/%3u C %c  ", xtemp0, target_temp0,
-                 opto0_state ? 'C' : 'O');
+        snprintf(buffer, sizeof(buffer), "%4u/%3uC %c %s", xtemp0, target_temp0,
+            opto0_state ? 'C' : 'O',
+            WiFi.status() == WL_CONNECTED ? "Wifi" : "NoWifi");
 
         lcd.setCursor(0, 0);
         lcd.print(buffer);
@@ -374,8 +441,8 @@ void lcd_main(void*) {
         if (xtemp1 >= 10000)
             xtemp1 = 9999;
 
-        snprintf(buffer, sizeof(buffer), "%4u C/%3u C %c  ", xtemp1, target_temp1,
-                 opto1_state ? 'C' : 'O');
+        snprintf(buffer, sizeof(buffer), "%4u/%3uC %c  ", xtemp1, target_temp1,
+            opto1_state ? 'C' : 'O');
 
         lcd.setCursor(0, 1);
         lcd.print(buffer);
@@ -405,62 +472,146 @@ void lcd_setup() {
 
 /******************************************************************************/
 
-const char* counter_topic = "pizza/temp0";
-char msg[20];
-int counter = 0;
-long lastMsg = 0;
+const char* heartbeat_topic = "pizza/heartbeat";
+unsigned mqtt_heartbeat = 0;
 
-const char* temperature_topic = "pizza/temp1";
-uint8_t temperature = 0;
+const char* temp0_topic = "pizza/temp0";
+const char* temp1_topic = "pizza/temp1";
+const char* temp_esp_topic = "pizza/temp_esp";
 
-void mqtt_poll() {
+double temp0_last = temp0;
+double temp1_last = temp1;
+float temp_esp_last = temp_esp;
+
+const char* target_temp0_topic = "pizza/target_temp0";
+const char* target_temp1_topic = "pizza/target_temp1";
+
+unsigned target_temp0_last = target_temp0;
+unsigned target_temp1_last = target_temp1;
+
+const char* opto0_state_topic = "pizza/opto0_state";
+const char* opto1_state_topic = "pizza/opto1_state";
+
+bool opto0_state_last = opto0_state;
+bool opto1_state_last = opto1_state;
+
+const char* pid_Kp_topic = "pizza/pid_Kp";
+const char* pid_Ki_topic = "pizza/pid_Ki";
+const char* pid_Kd_topic = "pizza/pid_Kd";
+
+double pid_Kp_last = pid_Kp;
+double pid_Ki_last = pid_Ki;
+double pid_Kd_last = pid_Kd;
+
+/*----------------------------------------------------------------------------*/
+
+void mqtt_subscribe() {
+    mqtt_client.subscribe(target_temp0_topic);
+    mqtt_client.subscribe(target_temp1_topic);
+
+    mqtt_client.subscribe(pid_Kp_topic);
+    mqtt_client.subscribe(pid_Ki_topic);
+    mqtt_client.subscribe(pid_Kd_topic);
+}
+
+void mqtt_callback(char* topic, byte* payload, unsigned int length) {
+    Serial.print("Message received: ");
+    Serial.println(topic);
+
+    Serial.print("payload: ");
+    for (int i = 0; i < length; i++) {
+        Serial.print((char)payload[i]);
+    }
+    Serial.println();
+
+    if (strcmp(topic, target_temp0_topic) == 0) {
+        payload[length] = 0;
+        target_temp0 = atoi(reinterpret_cast<const char*>(payload));
+        target_temp0_last = target_temp0;
+    }
+    else if (strcmp(topic, target_temp1_topic) == 0) {
+        payload[length] = 0;
+        target_temp1 = atoi(reinterpret_cast<const char*>(payload));
+        target_temp1_last = target_temp1;
+    }
+    else if (strcmp(topic, pid_Kp_topic) == 0) {
+        payload[length] = 0;
+        pid_Kp = atof(reinterpret_cast<const char*>(payload));
+        pid_Kp_last = pid_Kp;
+        pid0.SetTunings(pid_Kp, pid_Ki, pid_Kd);
+    }
+    else if (strcmp(topic, pid_Ki_topic) == 0) {
+        payload[length] = 0;
+        pid_Ki = atof(reinterpret_cast<const char*>(payload));
+        pid_Ki_last = pid_Ki;
+        pid0.SetTunings(pid_Kp, pid_Ki, pid_Kd);
+    }
+    else if (strcmp(topic, pid_Kd_topic) == 0) {
+        payload[length] = 0;
+        pid_Kd = atof(reinterpret_cast<const char*>(payload));
+        pid_Kd_last = pid_Kd;
+        pid0.SetTunings(pid_Kp, pid_Ki, pid_Kd);
+    }
+}
+
+void mqtt_poll(unsigned long now) {
+    char msg[32];
+
     /* if mqtt_client was disconnected then try to reconnect again */
     if (!mqtt_client.connected()) {
-        mqtt_connect();
+        mqtt_connect(now);
         return;
     }
 
     /* this function will listen for incoming topics */
     mqtt_client.loop();
 
-    /* we increase counter every 3 secs
-       we count until 3 secs reached to avoid blocking program if using
-       delay()*/
-    long now = millis();
-    if (now - lastMsg > 1000) {
-        lastMsg = now;
-        if (counter < 100) {
-            counter++;
-            snprintf(msg, 20, "%d", counter);
-            /* publish the message */
-            mqtt_client.publish(counter_topic, msg);
-        }
-        else {
-            counter = 0;
-        }
+    /* update MQTT values */
+    static unsigned long last_check = 0;
+    if (now < last_check)
+        return;
+    last_check = now + 1000;
 
-        snprintf(msg, 20, "%d", temperature);
-        /* publish the message */
-        mqtt_client.publish(temperature_topic, msg);
+    // send heartbeat message
+    mqtt_heartbeat++;
+    snprintf(msg, 20, "%d", mqtt_heartbeat);
+    mqtt_client.publish(heartbeat_topic, msg);
+
+    // update temperatures
+#define MQTT_DOUBLE(X)                                                         \
+    if (X != X##_last) {                                                       \
+        dtostrf(X, 12, 2, msg);                                                \
+        mqtt_client.publish(X##_topic, msg);                                   \
+        X##_last = X;                                                          \
     }
+#define MQTT_UNSIGNED(X)                                                       \
+    if (X != X##_last) {                                                       \
+        snprintf(msg, 20, "%u", X);                                            \
+        mqtt_client.publish(X##_topic, msg);                                   \
+        X##_last = X;                                                          \
+    }
+
+    MQTT_DOUBLE(temp0);
+    MQTT_DOUBLE(temp1);
+    MQTT_DOUBLE(temp_esp);
+
+    MQTT_UNSIGNED(target_temp0);
+    MQTT_UNSIGNED(target_temp1);
+
+    MQTT_UNSIGNED(opto0_state);
+    MQTT_UNSIGNED(opto1_state);
+
+    MQTT_DOUBLE(pid_Kp);
+    MQTT_DOUBLE(pid_Ki);
+    MQTT_DOUBLE(pid_Kd);
 }
 
 /******************************************************************************/
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-uint8_t temprature_sens_read();
-
-#ifdef __cplusplus
-}
-#endif
+// Controller Task Thread
 
 void task_main(void*) {
     while (true) {
-
-        temperature = temprature_sens_read();
+        pid_poll();
 
         // wait / yield time to other tasks
         vTaskDelay(1000 / portTICK_PERIOD_MS);
@@ -468,6 +619,8 @@ void task_main(void*) {
 }
 
 void task_setup() {
+    pid_setup();
+
     xTaskCreate(&task_main, // function
         "task_main",        // name
         2048,               // stack
@@ -499,8 +652,11 @@ void setup() {
 }
 
 void loop() {
+    unsigned long now = millis();
+
+    wifi_poll(now);
     ota_poll();
-    mqtt_poll();
+    mqtt_poll(now);
 
     vTaskDelay(250 / portTICK_PERIOD_MS);
 }
