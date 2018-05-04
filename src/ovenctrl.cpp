@@ -8,10 +8,33 @@ const char* wifi_sta_ssid = "gewifon";
 const char* wifi_sta_password = "wifi-pass";
 
 const char* wifi_ap_ssid = "Pizza Control";
-const char* wifi_ap_pass = "sWEE3hFoUGzn";
+const char* wifi_ap_pass = "pizzaoven";
 
 const char* dnsName = "pizza";        // Domain name for the mDNS responder
 IPAddress wifi_ap_ip(192, 168, 4, 1); // The IP address of the access point
+
+/******************************************************************************/
+// LockMutexGuard
+
+class LockMutexGuard {
+public:
+    LockMutexGuard(SemaphoreHandle_t& mutex) : mutex_(mutex), locked_(true) {
+        lock();
+    }
+
+    ~LockMutexGuard() {
+        if (locked_)
+            unlock();
+    }
+
+    void lock() { xSemaphoreTake(mutex_, portMAX_DELAY); };
+
+    void unlock() { xSemaphoreGive(mutex_); }
+
+private:
+    SemaphoreHandle_t& mutex_;
+    bool locked_;
+};
 
 /******************************************************************************/
 // ArduinoOTA
@@ -19,12 +42,6 @@ IPAddress wifi_ap_ip(192, 168, 4, 1); // The IP address of the access point
 #include <ArduinoOTA.h>
 
 void ota_setup() {
-    // Port defaults to 8266
-    // ArduinoOTA.setPort(8266);
-
-    // Hostname defaults to esp8266-[ChipID]
-    // ArduinoOTA.setHostname("myesp8266");
-
     // Password can be set with it's md5 value as well
     ArduinoOTA.setPasswordHash("5a75c115aab0352a300b32ece12f9af4");
 
@@ -122,15 +139,18 @@ void mdns_setup() { // Start the mDNS responder
 /******************************************************************************/
 // MAX6675 Thermocouple
 
-#include <MAX6675_Thermocouple.h>
+#include <MAX6675.h>
+#include <SPI.h>
+#include <FS.h>
+#include <SD.h>
 
 const int spi_sck_pin = 18;
 const int spi_so_pin = 19;
-const int spi_cs0_pin = 5;
-const int spi_cs1_pin = 17;
+const int spi_tc0_cs_pin = 16;
+const int spi_tc1_cs_pin = 17;
 
-MAX6675_Thermocouple thermocouple0(spi_sck_pin, spi_cs0_pin, spi_so_pin);
-MAX6675_Thermocouple thermocouple1(spi_sck_pin, spi_cs1_pin, spi_so_pin);
+MAX6675 thermocouple0(spi_tc0_cs_pin);
+MAX6675 thermocouple1(spi_tc1_cs_pin);
 
 volatile double temp0 = 0.0;
 volatile double temp1 = 0.0;
@@ -147,25 +167,45 @@ float temperatureRead();
 }
 #endif
 
-void temp_main(void*) {
+void ilog_sd_store();
+void ilog_sd_push();
+
+void spi_main(void*) {
+    int loop = 0;
+
     while (true) {
         // temp0 = thermocouple0.readCelsius();
         // temp1 = thermocouple1.readCelsius();
         temp_esp = temperatureRead();
 
+        // Serial.println(temp0);
+        // Serial.println(temp1);
+        // Serial.println(temp_esp);
+
+        ilog_sd_store();
+        ilog_sd_push();
+
         vTaskDelay(500 / portTICK_PERIOD_MS);
     }
 }
 
-void temp_setup() {
-    xTaskCreate(&temp_main, // function
-        "temp_main",        // name
-        2048,               // stack
-        NULL,               // void* to input parameter
-        10,                 // priority
-        NULL                // task handle
+void spi_setup() {
+    SPI.begin();
+
+    xTaskCreate(&spi_main, // function
+        "spi_main",        // name
+        8192,              // stack
+        NULL,              // void* to input parameter
+        10,                // priority
+        NULL               // task handle
     );
 }
+
+/******************************************************************************/
+// Relais Pins
+
+const int relay0_pin = 2;
+const int relay1_pin = 4;
 
 /******************************************************************************/
 // Buttons
@@ -239,9 +279,6 @@ void buttons_main(void*) {
             on_target_temp_down(target_temp1);
         }
 
-        digitalWrite(16, digitalRead(button_up0_pin));
-        digitalWrite(4, digitalRead(button_up1_pin));
-
         // wait / yield time to other tasks
         vTaskDelay(500 / portTICK_PERIOD_MS);
     }
@@ -253,10 +290,10 @@ void buttons_setup() {
     pinMode(button_up1_pin, INPUT_PULLUP);
     pinMode(button_down1_pin, INPUT_PULLUP);
 
-    pinMode(16, OUTPUT);
-    digitalWrite(16, HIGH);
-    pinMode(4, OUTPUT);
-    digitalWrite(4, HIGH);
+    pinMode(relay0_pin, OUTPUT);
+    digitalWrite(relay0_pin, LOW);
+    pinMode(relay1_pin, OUTPUT);
+    digitalWrite(relay1_pin, LOW);
 
     attachInterrupt(
         digitalPinToInterrupt(button_up0_pin), on_button_up0, FALLING);
@@ -269,7 +306,7 @@ void buttons_setup() {
 
     xTaskCreate(&buttons_main, // function
         "buttons_main",        // name
-        2048,                  // stack
+        1024,                  // stack
         NULL,                  // void* to input parameter
         10,                    // priority
         NULL                   // task handle
@@ -304,36 +341,60 @@ void opto_setup() {
 // Specify the initial tuning parameters
 double pid_Kp = 2, pid_Ki = 5, pid_Kd = 1;
 
-double pid_input0 = temp0;
-double pid_target0 = target_temp0;
-double pid_output0;
+double pid0_input = temp0;
+double pid0_target = target_temp0;
+double pid0_output = 0.0;
+
+double pid1_input = temp1;
+double pid1_target = target_temp1;
+double pid1_output = 0.0;
 
 PID pid0(
-    &pid_input0, &pid_output0, &pid_target0, pid_Kp, pid_Ki, pid_Kd, DIRECT);
+    &pid0_input, &pid0_output, &pid0_target, pid_Kp, pid_Ki, pid_Kd, DIRECT);
+PID pid1(
+    &pid1_input, &pid1_output, &pid1_target, pid_Kp, pid_Ki, pid_Kd, DIRECT);
 
 void pid_setup() {
     // turn the PID on
     pid0.SetMode(AUTOMATIC);
+    // output range 0-1
+    pid0.SetOutputLimits(0.0, 1.0);
+
+    // turn the PID on
+    pid1.SetMode(AUTOMATIC);
+    // output range 0-1
+    pid1.SetOutputLimits(0.0, 1.0);
 }
 
 double speed = 60.0;
 
 void pid_poll() {
     // ofen simulator
-    temp0 += pid_output0 / 255.0 * 0.3 * speed;
-    temp0 -= 0.012 * speed;
+    temp0 += pid0_output * 0.3 * speed;
+    temp0 *= (1.0 - 0.0052);
     if (random(32) < 8)
         temp0 -= 40;
 
-    pid_input0 = temp0;
-    pid_target0 = target_temp0;
+    temp1 += pid1_output * 0.3 * speed;
+    temp1 *= (1.0 - 0.0052);
+    if (random(32) < 8)
+        temp1 -= 40;
 
+    pid0_input = temp0;
+    pid0_target = target_temp0;
     pid0.Compute();
 
-    Serial.print("temp: ");
+    Serial.print("temp0: ");
     Serial.print(temp0);
-    Serial.print("pid: ");
-    Serial.println(pid_output0);
+    Serial.print(" pid: ");
+    Serial.println(pid0_output);
+
+    pid1_input = temp1;
+    pid1_target = target_temp1;
+    pid1.Compute();
+
+    digitalWrite(relay0_pin, pid0_output ? HIGH : LOW);
+    digitalWrite(relay1_pin, pid1_output ? HIGH : LOW);
 }
 
 /******************************************************************************/
@@ -341,6 +402,8 @@ void pid_poll() {
 
 #include <PubSubClient.h>
 #include <WiFiClientSecure.h>
+
+SemaphoreHandle_t mqtt_mutex;
 
 const char* mqtt_id = "pizza_control";
 const char* mqtt_user = "pizza";
@@ -402,7 +465,9 @@ void mqtt_connect(unsigned long now) {
 
     Serial.print("MQTT connecting ...");
     /* connect now */
-    if (mqtt_client.connect(mqtt_id, mqtt_user, mqtt_passwd)) {
+    if (mqtt_client.connect(mqtt_id, mqtt_user, mqtt_passwd,
+                            /* willTopic */ nullptr, /* willQos */ MQTTQOS2,
+                            /* willRetain */ true, /* willMessage */ nullptr)) {
         Serial.println("connected");
         /* subscribe topics */
         mqtt_subscribe();
@@ -415,6 +480,368 @@ void mqtt_connect(unsigned long now) {
 }
 
 /******************************************************************************/
+// NTP RTC Client
+
+#include <DS3231.h>
+#include <NTPClient.h>
+#include <WiFiUdp.h>
+
+SemaphoreHandle_t i2c_mutex;
+
+// RTC module
+DS3231 ds_rtc;
+unsigned long ds_rtc_now = 0;
+unsigned long ds_rtc_millis = 0;
+
+// By default 'time.nist.gov' is used with 60 seconds update interval and no
+// offset
+WiFiUDP ntp_udp;
+NTPClient ntp_client(ntp_udp, "europe.pool.ntp.org", 0, 3600000);
+
+// Switched to NTP time
+bool ntp_update_done = false;
+
+unsigned long long rtc_epoch_millis() {
+    if (ntp_update_done)
+        return ntp_client.getEpochMilli();
+    else
+        return (unsigned long long)ds_rtc_now * 1000 + millis() - ds_rtc_millis;
+}
+
+void ntp_setup() {
+    LockMutexGuard lock(i2c_mutex);
+
+    // Start the I2C interface
+    Wire.begin();
+
+    // read initial date/time
+    DateTime dt = RTClib::now();
+    ds_rtc_millis = millis();
+    ds_rtc_now = dt.unixtime();
+    Serial.print("ds_rtc_now ");
+    Serial.println(ds_rtc_now);
+
+    // initialize NTP
+    ntp_client.begin();
+}
+
+void ntp_poll() {
+
+    if (WiFi.status() == WL_CONNECTED) {
+        ntp_client.update();
+
+        if (!ntp_update_done) {
+            Serial.println("ntp update done");
+
+            unsigned long ts = ntp_client.getEpochTime();
+            Serial.print("ntp ts ");
+            Serial.println(ts);
+
+            Serial.print("ntp rtc delta ");
+            Serial.println(
+                (long)((long long)ts - (long long)rtc_epoch_millis() / 1000));
+
+            ntp_update_done = true;
+
+            LockMutexGuard lock(i2c_mutex);
+
+            DateTime tm(ts);
+            ds_rtc.setClockMode(/* 24-hour */ false);
+            ds_rtc.setYear(tm.year() - 2000);
+            ds_rtc.setMonth(tm.month());
+            ds_rtc.setDate(tm.day());
+            ds_rtc.setHour(tm.hour());
+            ds_rtc.setMinute(tm.minute());
+            ds_rtc.setSecond(tm.second());
+        }
+    }
+}
+
+/******************************************************************************/
+// Influx/SDCard Logger
+
+struct LogEntry {
+    unsigned long long ts;
+    double temp0, temp1;
+    double temp_esp;
+    unsigned target_temp0, target_temp1;
+    unsigned char opto0_state, opto1_state;
+    double pid_Kp, pid_Ki, pid_Kd;
+    double pid0, pid1;
+};
+
+const size_t ilog_size = 120;
+static LogEntry ilog_list[ilog_size];
+static size_t ilog_pos = 0;
+
+const size_t ilog_pos_push = 2;
+const size_t ilog_pos_store = 60;
+
+bool ilog_no_sdcard = false;
+
+SemaphoreHandle_t ilog_mutex;
+
+void ilog_main(void*) {
+
+    while (true) {
+        long long ts = rtc_epoch_millis();
+        if (ts >= 1000000) {
+            // create new log entry
+            LockMutexGuard lock(ilog_mutex);
+
+            if (ilog_pos < ilog_size) {
+                LogEntry& e = ilog_list[ilog_pos++];
+                Serial.print("filling ");
+                Serial.println(ilog_pos - 1);
+
+                e.ts = ts;
+                e.temp0 = temp0, e.temp1 = temp1;
+                e.temp_esp = temp_esp;
+                e.target_temp0 = target_temp0, e.target_temp1 = target_temp1;
+                e.opto0_state = opto0_state, e.opto1_state = opto1_state;
+                e.pid_Kp = pid_Kp, e.pid_Ki = pid_Ki, e.pid_Kd = pid_Kd;
+                e.pid0 = pid0_output, e.pid1 = pid0_output;
+            }
+        }
+
+        vTaskDelay(1000 / portTICK_PERIOD_MS);
+    }
+}
+
+void ilog_push() {
+    LockMutexGuard lock(ilog_mutex);
+
+    if (ilog_pos < ilog_pos_push)
+        return;
+
+    {
+        LockMutexGuard lock(mqtt_mutex);
+        if (!mqtt_client.connected())
+            return;
+    }
+
+    static char buffer[768];
+    size_t out = 0;
+
+    size_t ilog_use;
+    for (ilog_use = 0; ilog_use < ilog_pos; ++ilog_use) {
+        const LogEntry& e = ilog_list[ilog_use];
+
+        char buffer0[32], buffer1[32], buffer_esp[32];
+        char buffer_pid_Kp[32], buffer_pid_Ki[32], buffer_pid_Kd[32];
+        char buffer_pid0[32], buffer_pid1[32];
+
+        dtostrf(e.temp0, 0, 2, buffer0);
+        dtostrf(e.temp1, 0, 2, buffer1);
+        dtostrf(e.temp_esp, 0, 2, buffer_esp);
+
+        dtostrf(e.pid_Kp, 0, 2, buffer_pid_Kp);
+        dtostrf(e.pid_Ki, 0, 2, buffer_pid_Ki);
+        dtostrf(e.pid_Kd, 0, 2, buffer_pid_Kd);
+
+        dtostrf(e.pid0, 0, 2, buffer_pid0);
+        dtostrf(e.pid1, 0, 2, buffer_pid1);
+
+        int a = snprintf(
+            buffer + out, sizeof(buffer) - out,
+            "pizza temp0=%s,temp1=%s,"
+            "target_temp0=%u,target_temp1=%u,"
+            "temp_esp=%s,"
+            "opto0=%u,opto1=%u,"
+            "pid_Kp=%s,pid_Ki=%s,pid_Kd=%s,"
+            "pid0=%s,pid1=%s "
+            "%0lu%06lu000000\n",
+            buffer0, buffer1, e.target_temp0, e.target_temp1, buffer_esp,
+            e.opto0_state, e.opto1_state, buffer_pid_Kp, buffer_pid_Ki,
+            buffer_pid_Kd, buffer_pid0, buffer_pid1,
+            (unsigned long)(e.ts / 1000000L), (unsigned long)(e.ts % 1000000L));
+
+        if (a >= sizeof(buffer) - out)
+            break;
+
+        out += a;
+    }
+
+    Serial.print("logentry ");
+    Serial.println(ilog_use);
+    Serial.print("out ");
+    Serial.println(out);
+
+    if (!mqtt_client.publish(
+            "pizza/influx_data", (uint8_t*)buffer, out, /* retain */ false))
+        return;
+
+    memmove(ilog_list, ilog_list + ilog_use,
+            (ilog_pos - ilog_use) * sizeof(ilog_list[0]));
+    ilog_pos -= ilog_use;
+}
+
+void ilog_push_loop(void*) {
+    while (true) {
+        ilog_push();
+        vTaskDelay(100 / portTICK_PERIOD_MS);
+    }
+}
+
+void ilog_sd_store() {
+    unsigned long now = millis();
+
+    static unsigned long last_check = 0;
+    if (last_check > now)
+        return;
+
+    last_check = now + 2000;
+
+    /**************************************************************************/
+
+    LockMutexGuard lock(ilog_mutex);
+
+    if (ilog_pos < ilog_pos_store)
+        return;
+
+
+    uint32_t start = millis();
+
+    if (!SD.begin(5)) {
+        Serial.println("Card Mount Failed");
+        ilog_no_sdcard = true;
+        SD.end();
+        return;
+    }
+
+    uint8_t cardType = SD.cardType();
+    if (cardType == CARD_NONE) {
+        Serial.println("No SD card attached");
+        ilog_no_sdcard = true;
+        SD.end();
+        return;
+    }
+
+    char filename[48];
+    snprintf(filename, sizeof(filename), "/log-%0lu%06lu.dat",
+        (unsigned long)(ilog_list[0].ts / 1000000L),
+        (unsigned long)(ilog_list[0].ts % 1000000L));
+
+    File file = SD.open(filename, FILE_WRITE);
+    if (!file) {
+        Serial.println("Failed to open file for writing");
+        ilog_no_sdcard = true;
+        SD.end();
+        return;
+    }
+
+    file.write(reinterpret_cast<const uint8_t*>(ilog_list),
+        sizeof(ilog_list[0]) * ilog_pos);
+    file.close();
+
+    uint32_t end = millis() - start;
+
+    Serial.printf("%u bytes written for %u ms to %s\n",
+        sizeof(ilog_list[0]) * ilog_pos, end, filename);
+
+    ilog_pos = 0;
+
+    ilog_no_sdcard = false;
+    SD.end();
+}
+
+void ilog_sd_push() {
+
+    unsigned long now = millis();
+
+    static unsigned long last_check = 0;
+    if (last_check > now)
+        return;
+
+    last_check = now + 10000;
+
+    /**************************************************************************/
+
+    uint32_t start = millis();
+
+    {
+        LockMutexGuard lock(mqtt_mutex);
+        if (!mqtt_client.connected())
+            return;
+    }
+
+    if (!SD.begin(5)) {
+        Serial.println("Card Mount Failed");
+        return;
+    }
+
+    uint8_t cardType = SD.cardType();
+    if (cardType == CARD_NONE) {
+        Serial.println("No SD card attached");
+        return;
+    }
+
+    File root = SD.open("/");
+    if (!root) {
+        Serial.println("Failed to open root directory");
+        return;
+    }
+    if (!root.isDirectory()) {
+        Serial.println("Root is not a directory");
+        return;
+    }
+
+    size_t count = 0;
+    File file = root.openNextFile();
+    while (file) {
+        if (!file.isDirectory()) {
+            Serial.print("  FILE: ");
+            Serial.print(file.name());
+            Serial.print("  SIZE: ");
+            Serial.println(file.size());
+
+            LockMutexGuard lock(ilog_mutex);
+
+            if (strncmp(file.name(), "/log-", 5) == 0 &&
+                file.size() % sizeof(LogEntry) == 0 &&
+                ilog_pos + file.size() / sizeof(LogEntry) + 16 < ilog_size)
+            {
+                file.read((uint8_t*)(ilog_list + ilog_pos), file.size());
+                ilog_pos += file.size() / sizeof(LogEntry);
+
+                Serial.print("ilog_sd_push read: ");
+                Serial.println(file.size() / sizeof(LogEntry));
+
+                if (SD.remove(file.name())) {
+                    Serial.println("ilog_sd_push file deleted");
+                }
+                else {
+                    Serial.println("ilog_sd_push delete failed");
+                }
+                break;
+            }
+        }
+        file = root.openNextFile();
+    }
+
+    Serial.printf("ilog_sd_push() done in %u ms\n",
+                  millis() - start);
+}
+
+void ilog_setup() {
+    xTaskCreate(&ilog_main, // function
+        "ilog_main",        // name
+        1024,               // stack
+        NULL,               // void* to input parameter
+        10,                 // priority
+        NULL                // task handle
+    );
+
+    xTaskCreate(&ilog_push_loop, // function
+        "ilog_push_loop",        // name
+        8192,                    // stack
+        NULL,                    // void* to input parameter
+        10,                      // priority
+        NULL                     // task handle
+    );
+}
+
+/******************************************************************************/
 // LCD
 
 #include <LiquidCrystal_I2C.h>
@@ -423,29 +850,33 @@ void mqtt_connect(unsigned long now) {
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 
 void lcd_main(void*) {
-    char buffer[32];
+    char buffer0[32], buffer1[32];
 
     while (true) {
         unsigned xtemp0 = temp0;
         if (xtemp0 >= 10000)
             xtemp0 = 9999;
 
-        snprintf(buffer, sizeof(buffer), "%4u/%3uC %c %s", xtemp0, target_temp0,
-            opto0_state ? 'C' : 'O',
-            WiFi.status() == WL_CONNECTED ? "Wifi" : "NoWifi");
-
-        lcd.setCursor(0, 0);
-        lcd.print(buffer);
+        snprintf(buffer0, sizeof(buffer0), "%4u/%3uC %c %s", xtemp0,
+            target_temp0, opto0_state ? 'C' : 'O',
+            WiFi.status() == WL_CONNECTED ? "Wifi" : "NoWF");
 
         unsigned xtemp1 = temp1;
         if (xtemp1 >= 10000)
             xtemp1 = 9999;
 
-        snprintf(buffer, sizeof(buffer), "%4u/%3uC %c  ", xtemp1, target_temp1,
-            opto1_state ? 'C' : 'O');
+        snprintf(buffer1, sizeof(buffer1), "%4u/%3uC %c %s", xtemp1,
+            target_temp1, opto1_state ? 'C' : 'O',
+                 ilog_no_sdcard ? "NoSD" : "SD");
 
-        lcd.setCursor(0, 1);
-        lcd.print(buffer);
+        {
+            LockMutexGuard lock(i2c_mutex);
+
+            lcd.setCursor(0, 0);
+            lcd.print(buffer0);
+            lcd.setCursor(0, 1);
+            lcd.print(buffer1);
+        }
 
         // wait / yield time to other tasks
         vTaskDelay(500 / portTICK_PERIOD_MS);
@@ -453,6 +884,8 @@ void lcd_main(void*) {
 }
 
 void lcd_setup() {
+    LockMutexGuard lock(i2c_mutex);
+
     // initialize the LCD via pins 21, 22
     lcd.begin();
 
@@ -539,22 +972,27 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
         pid_Kp = atof(reinterpret_cast<const char*>(payload));
         pid_Kp_last = pid_Kp;
         pid0.SetTunings(pid_Kp, pid_Ki, pid_Kd);
+        pid1.SetTunings(pid_Kp, pid_Ki, pid_Kd);
     }
     else if (strcmp(topic, pid_Ki_topic) == 0) {
         payload[length] = 0;
         pid_Ki = atof(reinterpret_cast<const char*>(payload));
         pid_Ki_last = pid_Ki;
         pid0.SetTunings(pid_Kp, pid_Ki, pid_Kd);
+        pid1.SetTunings(pid_Kp, pid_Ki, pid_Kd);
     }
     else if (strcmp(topic, pid_Kd_topic) == 0) {
         payload[length] = 0;
         pid_Kd = atof(reinterpret_cast<const char*>(payload));
         pid_Kd_last = pid_Kd;
         pid0.SetTunings(pid_Kp, pid_Ki, pid_Kd);
+        pid1.SetTunings(pid_Kp, pid_Ki, pid_Kd);
     }
 }
 
 void mqtt_poll(unsigned long now) {
+    LockMutexGuard lock(mqtt_mutex);
+
     char msg[32];
 
     /* if mqtt_client was disconnected then try to reconnect again */
@@ -580,14 +1018,14 @@ void mqtt_poll(unsigned long now) {
     // update temperatures
 #define MQTT_DOUBLE(X)                                                         \
     if (X != X##_last) {                                                       \
-        dtostrf(X, 12, 2, msg);                                                \
-        mqtt_client.publish(X##_topic, msg);                                   \
+        dtostrf(X, 0, 2, msg);                                                 \
+        mqtt_client.publish(X##_topic, msg, /* retained */ true);              \
         X##_last = X;                                                          \
     }
 #define MQTT_UNSIGNED(X)                                                       \
     if (X != X##_last) {                                                       \
-        snprintf(msg, 20, "%u", X);                                            \
-        mqtt_client.publish(X##_topic, msg);                                   \
+        snprintf(msg, sizeof(msg), "%u", X);                                   \
+        mqtt_client.publish(X##_topic, msg, /* retained */ true);              \
         X##_last = X;                                                          \
     }
 
@@ -637,16 +1075,27 @@ void setup() {
     Serial.begin(115200);
     Serial.println("Booting");
 
+    i2c_mutex = xSemaphoreCreateMutex();
+    xSemaphoreGive(i2c_mutex);
+
+    mqtt_mutex = xSemaphoreCreateMutex();
+    xSemaphoreGive(mqtt_mutex);
+
+    ilog_mutex = xSemaphoreCreateMutex();
+    xSemaphoreGive(ilog_mutex);
+
     lcd_setup();
 
     wifi_setup();
     mdns_setup();
     ota_setup();
     mqtt_setup();
+    ntp_setup();
 
-    temp_setup();
+    ilog_setup();
     buttons_setup();
     opto_setup();
+    spi_setup();
 
     task_setup();
 }
@@ -657,6 +1106,7 @@ void loop() {
     wifi_poll(now);
     ota_poll();
     mqtt_poll(now);
+    ntp_poll();
 
     vTaskDelay(250 / portTICK_PERIOD_MS);
 }
