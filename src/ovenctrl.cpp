@@ -3,6 +3,8 @@
 
 #include <Arduino.h>
 
+#include <deque>
+
 /* change it with your wifi_sta_ssid-wifi_sta_password */
 const char* wifi_sta_ssid = "gewifon";
 const char* wifi_sta_password = "wifi-pass";
@@ -152,15 +154,15 @@ const int spi_tc1_cs_pin = 17;
 MAX6675 thermocouple0(spi_tc0_cs_pin);
 MAX6675 thermocouple1(spi_tc1_cs_pin);
 
-volatile double temp0 = 0.0;
-volatile double temp1 = 0.0;
-volatile float temp_esp = 0.0;
+double temp0 = 0.0;
+double temp1 = 0.0;
+float temp_esp = 0.0;
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-// ESP internal temperature
+// ESP internal temperature in Celsius
 float temperatureRead();
 
 #ifdef __cplusplus
@@ -174,13 +176,9 @@ void spi_main(void*) {
     int loop = 0;
 
     while (true) {
-        // temp0 = thermocouple0.readCelsius();
-        // temp1 = thermocouple1.readCelsius();
+        double temp0 = thermocouple0.readCelsius();
+        double temp1 = thermocouple1.readCelsius();
         temp_esp = temperatureRead();
-
-        // Serial.println(temp0);
-        // Serial.println(temp1);
-        // Serial.println(temp_esp);
 
         ilog_sd_store();
         ilog_sd_push();
@@ -366,35 +364,50 @@ void pid_setup() {
     pid1.SetOutputLimits(0.0, 1.0);
 }
 
-double speed = 60.0;
+const unsigned speed = 5;
 
 void pid_poll() {
     // ofen simulator
-    temp0 += pid0_output * 0.3 * speed;
-    temp0 *= (1.0 - 0.0052);
-    if (random(32) < 8)
-        temp0 -= 40;
+    static std::deque<bool> pid0_heat = { false, false, false, false, false, false };
+    temp0 += pid0_heat.front() * 0.3 * speed;
+    for (size_t i = 0; i < speed; ++i) {
+        temp0 *= (1.0 - 0.000052);
+    }
+    if (random(2200) < 8 * speed && temp0 > 30)
+        temp0 -= 30;
 
-    temp1 += pid1_output * 0.3 * speed;
-    temp1 *= (1.0 - 0.0052);
-    if (random(32) < 8)
-        temp1 -= 40;
+    pid0_heat.pop_front();
+    pid0_heat.push_back(pid0_output >= 0.5);
+
+    static std::deque<bool> pid1_heat = { false, false, false, false, false, false };
+    temp1 += pid1_heat.front() * 0.3 * speed;
+    for (size_t i = 0; i < speed; ++i) {
+        temp1 *= (1.0 - 0.000052);
+    }
+    if (random(2200) < 8 * speed  && temp1 > 30)
+        temp1 -= 30;
+    pid1_heat.pop_front();
+    pid1_heat.push_back(pid1_output >= 0.5);
 
     pid0_input = temp0;
     pid0_target = target_temp0;
     pid0.Compute();
 
-    Serial.print("temp0: ");
-    Serial.print(temp0);
-    Serial.print(" pid: ");
-    Serial.println(pid0_output);
-
     pid1_input = temp1;
     pid1_target = target_temp1;
     pid1.Compute();
 
-    digitalWrite(relay0_pin, pid0_output ? HIGH : LOW);
-    digitalWrite(relay1_pin, pid1_output ? HIGH : LOW);
+    Serial.print("temp0: ");
+    Serial.print(temp0);
+    Serial.print(" pid: ");
+    Serial.print(pid0_output);
+    Serial.print(" temp1: ");
+    Serial.print(temp1);
+    Serial.print(" pid: ");
+    Serial.println(pid1_output);
+
+    digitalWrite(relay0_pin, pid0_output >= 0.5 ? HIGH : LOW);
+    digitalWrite(relay1_pin, pid1_output >= 0.5 ? HIGH : LOW);
 }
 
 /******************************************************************************/
@@ -527,33 +540,34 @@ void ntp_setup() {
 
 void ntp_poll() {
 
-    if (WiFi.status() == WL_CONNECTED) {
-        ntp_client.update();
+    if (WiFi.status() != WL_CONNECTED)
+        return;
 
-        if (!ntp_update_done) {
-            Serial.println("ntp update done");
+    ntp_client.update();
 
-            unsigned long ts = ntp_client.getEpochTime();
-            Serial.print("ntp ts ");
-            Serial.println(ts);
+    if (!ntp_update_done) {
+        Serial.println("ntp update done");
 
-            Serial.print("ntp rtc delta ");
-            Serial.println(
-                (long)((long long)ts - (long long)rtc_epoch_millis() / 1000));
+        unsigned long ts = ntp_client.getEpochTime();
+        Serial.print("ntp ts ");
+        Serial.println(ts);
 
-            ntp_update_done = true;
+        Serial.print("ntp rtc delta ");
+        Serial.println(
+            (long)((long long)ts - (long long)rtc_epoch_millis() / 1000));
 
-            LockMutexGuard lock(i2c_mutex);
+        ntp_update_done = true;
 
-            DateTime tm(ts);
-            ds_rtc.setClockMode(/* 24-hour */ false);
-            ds_rtc.setYear(tm.year() - 2000);
-            ds_rtc.setMonth(tm.month());
-            ds_rtc.setDate(tm.day());
-            ds_rtc.setHour(tm.hour());
-            ds_rtc.setMinute(tm.minute());
-            ds_rtc.setSecond(tm.second());
-        }
+        LockMutexGuard lock(i2c_mutex);
+
+        DateTime tm(ts);
+        ds_rtc.setClockMode(/* 24-hour */ false);
+        ds_rtc.setYear(tm.year() - 2000);
+        ds_rtc.setMonth(tm.month());
+        ds_rtc.setDate(tm.day());
+        ds_rtc.setHour(tm.hour());
+        ds_rtc.setMinute(tm.minute());
+        ds_rtc.setSecond(tm.second());
     }
 }
 
@@ -578,6 +592,7 @@ const size_t ilog_pos_push = 2;
 const size_t ilog_pos_store = 60;
 
 bool ilog_no_sdcard = false;
+bool ilog_sdcard_empty = false;
 
 SemaphoreHandle_t ilog_mutex;
 
@@ -667,9 +682,13 @@ void ilog_push() {
     Serial.print("out ");
     Serial.println(out);
 
-    if (!mqtt_client.publish(
-            "pizza/influx_data", (uint8_t*)buffer, out, /* retain */ false))
-        return;
+    {
+        LockMutexGuard lock(mqtt_mutex);
+        if (!mqtt_client.publish(
+                "pizza/influx_data", (uint8_t*)buffer, out,
+                /* retain */ false))
+            return;
+    }
 
     memmove(ilog_list, ilog_list + ilog_use,
             (ilog_pos - ilog_use) * sizeof(ilog_list[0]));
@@ -742,10 +761,14 @@ void ilog_sd_store() {
     ilog_pos = 0;
 
     ilog_no_sdcard = false;
+    ilog_sdcard_empty = false;
+
     SD.end();
 }
 
 void ilog_sd_push() {
+
+    if (ilog_sdcard_empty) return;
 
     unsigned long now = millis();
 
@@ -767,28 +790,33 @@ void ilog_sd_push() {
 
     if (!SD.begin(5)) {
         Serial.println("Card Mount Failed");
+        ilog_no_sdcard = true;
         return;
     }
 
     uint8_t cardType = SD.cardType();
     if (cardType == CARD_NONE) {
         Serial.println("No SD card attached");
+        ilog_no_sdcard = true;
         return;
     }
 
     File root = SD.open("/");
     if (!root) {
         Serial.println("Failed to open root directory");
+        ilog_no_sdcard = true;
         return;
     }
     if (!root.isDirectory()) {
         Serial.println("Root is not a directory");
+        ilog_no_sdcard = true;
         return;
     }
 
     size_t count = 0;
     File file = root.openNextFile();
     while (file) {
+        ++count;
         if (!file.isDirectory()) {
             Serial.print("  FILE: ");
             Serial.print(file.name());
@@ -821,6 +849,11 @@ void ilog_sd_push() {
 
     Serial.printf("ilog_sd_push() done in %u ms\n",
                   millis() - start);
+
+    ilog_no_sdcard = false;
+
+    if (count == 0)
+        ilog_sdcard_empty = true;
 }
 
 void ilog_setup() {
@@ -945,6 +978,9 @@ void mqtt_subscribe() {
     mqtt_client.subscribe(pid_Kp_topic);
     mqtt_client.subscribe(pid_Ki_topic);
     mqtt_client.subscribe(pid_Kd_topic);
+
+    mqtt_client.subscribe(temp0_topic);
+    mqtt_client.subscribe(temp1_topic);
 }
 
 void mqtt_callback(char* topic, byte* payload, unsigned int length) {
@@ -987,6 +1023,14 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
         pid_Kd_last = pid_Kd;
         pid0.SetTunings(pid_Kp, pid_Ki, pid_Kd);
         pid1.SetTunings(pid_Kp, pid_Ki, pid_Kd);
+    }
+    else if (strcmp(topic, temp0_topic) == 0) {
+        payload[length] = 0;
+        temp0 = atof(reinterpret_cast<const char*>(payload));
+    }
+    else if (strcmp(topic, temp1_topic) == 0) {
+        payload[length] = 0;
+        temp1 = atof(reinterpret_cast<const char*>(payload));
     }
 }
 
