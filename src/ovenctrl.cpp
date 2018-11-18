@@ -8,6 +8,8 @@
 /* change it with your wifi_sta_ssid-wifi_sta_password */
 const char* wifi_sta_ssid = "gewifon";
 const char* wifi_sta_password = "wifi-pass";
+// const char* wifi_sta_ssid = "GPN18-insecureXXX";
+// const char* wifi_sta_password = "";
 
 const char* wifi_ap_ssid = "Pizza Control";
 const char* wifi_ap_pass = "pizzaoven";
@@ -148,8 +150,8 @@ void mdns_setup() { // Start the mDNS responder
 
 const int spi_sck_pin = 18;
 const int spi_so_pin = 19;
-const int spi_tc0_cs_pin = 16;
-const int spi_tc1_cs_pin = 17;
+const int spi_tc0_cs_pin = 17;
+const int spi_tc1_cs_pin = 16;
 
 MAX6675 thermocouple0(spi_tc0_cs_pin);
 MAX6675 thermocouple1(spi_tc1_cs_pin);
@@ -176,8 +178,8 @@ void spi_main(void*) {
     int loop = 0;
 
     while (true) {
-        double temp0 = thermocouple0.readCelsius();
-        double temp1 = thermocouple1.readCelsius();
+        temp0 = thermocouple0.readCelsius();
+        temp1 = thermocouple1.readCelsius();
         temp_esp = temperatureRead();
 
         ilog_sd_store();
@@ -202,8 +204,8 @@ void spi_setup() {
 /******************************************************************************/
 // Relais Pins
 
-const int relay0_pin = 2;
-const int relay1_pin = 4;
+const int relay0_pin = 4;
+const int relay1_pin = 2;
 
 /******************************************************************************/
 // Buttons
@@ -222,14 +224,14 @@ volatile unsigned isr_last_ts = 0;
 const int max_temp = 900;
 
 static inline void on_target_temp_up(volatile unsigned& temp) {
-    if (temp + 25 < max_temp)
-        temp += 25;
+    if (temp + 20 < max_temp)
+        temp += 20;
     else
         temp = max_temp;
 }
 static inline void on_target_temp_down(volatile unsigned& temp) {
-    if (temp >= 25)
-        temp -= 25;
+    if (temp >= 20)
+        temp -= 20;
     else
         temp = 0;
 }
@@ -263,6 +265,9 @@ void IRAM_ATTR on_button_down1() {
 void buttons_main(void*) {
     while (true) {
         isr_ts = millis();
+
+        target_temp0 = 200;
+        target_temp1 = 200;
 
         if (digitalRead(button_up0_pin) == LOW) {
             on_target_temp_up(target_temp0);
@@ -364,50 +369,62 @@ void pid_setup() {
     pid1.SetOutputLimits(0.0, 1.0);
 }
 
-const unsigned speed = 5;
+const unsigned speed = 1;
 
 void pid_poll() {
-    // ofen simulator
-    static std::deque<bool> pid0_heat = { false, false, false, false, false, false };
-    temp0 += pid0_heat.front() * 0.3 * speed;
-    for (size_t i = 0; i < speed; ++i) {
-        temp0 *= (1.0 - 0.000052);
+    if (0) {
+        // ofen simulator
+        static std::deque<bool> pid0_heat = { false, false, false, false, false, false };
+        temp0 += pid0_heat.front() * 0.3 * speed;
+        for (size_t i = 0; i < speed; ++i) {
+            temp0 *= (1.0 - 0.000052);
+        }
+        if (random(2200) < 8 * speed && temp0 > 30)
+            temp0 -= 30;
+
+        static std::deque<bool> pid1_heat = { false, false, false, false, false, false };
+        temp1 += pid1_heat.front() * 0.3 * speed;
+        for (size_t i = 0; i < speed; ++i) {
+            temp1 *= (1.0 - 0.000052);
+        }
+        if (random(2200) < 8 * speed  && temp1 > 30)
+            temp1 -= 30;
     }
-    if (random(2200) < 8 * speed && temp0 > 30)
-        temp0 -= 30;
 
-    pid0_heat.pop_front();
-    pid0_heat.push_back(pid0_output >= 0.5);
+    static unsigned round = 5;
+    if (round-- == 0) {
+        round = 5;
+        // pid0_heat.pop_front();
+        // pid0_heat.push_back(pid0_output >= 0.5);
 
-    static std::deque<bool> pid1_heat = { false, false, false, false, false, false };
-    temp1 += pid1_heat.front() * 0.3 * speed;
-    for (size_t i = 0; i < speed; ++i) {
-        temp1 *= (1.0 - 0.000052);
+        // pid1_heat.pop_front();
+        // pid1_heat.push_back(pid1_output >= 0.5);
+
+        pid0_input = temp0;
+        pid0_target = target_temp0;
+        pid0.Compute();
+
+        pid1_input = temp1;
+        pid1_target = target_temp1;
+        pid1.Compute();
+
+        Serial.print("temp0: ");
+        Serial.print(temp0);
+        Serial.print(" pid: ");
+        Serial.print(pid0_output);
+        Serial.print(" temp1: ");
+        Serial.print(temp1);
+        Serial.print(" pid: ");
+        Serial.println(pid1_output);
+
+        if (target_temp0 == 0)
+            pid0_output = 0;
+        if (target_temp1 == 0)
+            pid1_output = 0;
+
+        digitalWrite(relay0_pin, pid0_output >= 0.5 ? HIGH : LOW);
+        digitalWrite(relay1_pin, pid1_output >= 0.5 ? HIGH : LOW);
     }
-    if (random(2200) < 8 * speed  && temp1 > 30)
-        temp1 -= 30;
-    pid1_heat.pop_front();
-    pid1_heat.push_back(pid1_output >= 0.5);
-
-    pid0_input = temp0;
-    pid0_target = target_temp0;
-    pid0.Compute();
-
-    pid1_input = temp1;
-    pid1_target = target_temp1;
-    pid1.Compute();
-
-    Serial.print("temp0: ");
-    Serial.print(temp0);
-    Serial.print(" pid: ");
-    Serial.print(pid0_output);
-    Serial.print(" temp1: ");
-    Serial.print(temp1);
-    Serial.print(" pid: ");
-    Serial.println(pid1_output);
-
-    digitalWrite(relay0_pin, pid0_output >= 0.5 ? HIGH : LOW);
-    digitalWrite(relay1_pin, pid1_output >= 0.5 ? HIGH : LOW);
 }
 
 /******************************************************************************/
@@ -452,7 +469,8 @@ const char* mqtt_ca_cert =
     "-----END CERTIFICATE-----";
 
 /* create an instance of WiFiClientSecure */
-WiFiClientSecure mqtt_wifi_client;
+//WiFiClientSecure mqtt_wifi_client;
+WiFiClient mqtt_wifi_client;
 PubSubClient mqtt_client(mqtt_wifi_client);
 
 void mqtt_callback(char* topic, byte* payload, unsigned int length);
@@ -460,9 +478,9 @@ void mqtt_subscribe();
 
 void mqtt_setup() {
     /* set SSL/TLS certificate */
-    mqtt_wifi_client.setCACert(mqtt_ca_cert);
+    //mqtt_wifi_client.setCACert(mqtt_ca_cert);
     /* configure the MQTT server with IP address and port */
-    mqtt_client.setServer("panthema.net", 993);
+    mqtt_client.setServer("panthema.net", 1883);
     // mqtt_callback function will be invoked when subscribed topic are received
     mqtt_client.setCallback(mqtt_callback);
 }
@@ -584,7 +602,7 @@ struct LogEntry {
     double pid0, pid1;
 };
 
-const size_t ilog_size = 120;
+const size_t ilog_size = 240;
 static LogEntry ilog_list[ilog_size];
 static size_t ilog_pos = 0;
 
@@ -615,7 +633,7 @@ void ilog_main(void*) {
                 e.target_temp0 = target_temp0, e.target_temp1 = target_temp1;
                 e.opto0_state = opto0_state, e.opto1_state = opto1_state;
                 e.pid_Kp = pid_Kp, e.pid_Ki = pid_Ki, e.pid_Kd = pid_Kd;
-                e.pid0 = pid0_output, e.pid1 = pid0_output;
+                e.pid0 = pid0_output, e.pid1 = pid1_output;
             }
         }
 
@@ -635,7 +653,7 @@ void ilog_push() {
             return;
     }
 
-    static char buffer[768];
+    static char buffer[1*768];
     size_t out = 0;
 
     size_t ilog_use;
@@ -645,6 +663,9 @@ void ilog_push() {
         char buffer0[32], buffer1[32], buffer_esp[32];
         char buffer_pid_Kp[32], buffer_pid_Ki[32], buffer_pid_Kd[32];
         char buffer_pid0[32], buffer_pid1[32];
+
+        if (e.temp0 != e.temp0 || e.temp1 != e.temp1)
+            continue;
 
         dtostrf(e.temp0, 0, 2, buffer0);
         dtostrf(e.temp1, 0, 2, buffer1);
@@ -693,6 +714,9 @@ void ilog_push() {
     memmove(ilog_list, ilog_list + ilog_use,
             (ilog_pos - ilog_use) * sizeof(ilog_list[0]));
     ilog_pos -= ilog_use;
+
+    Serial.print("remain ");
+    Serial.println(ilog_pos);
 }
 
 void ilog_push_loop(void*) {
@@ -710,6 +734,7 @@ void ilog_sd_store() {
         return;
 
     last_check = now + 2000;
+    return;
 
     /**************************************************************************/
 
@@ -721,10 +746,9 @@ void ilog_sd_store() {
 
     uint32_t start = millis();
 
-    if (!SD.begin(5)) {
+    if (ilog_no_sdcard && !SD.begin(5)) {
         Serial.println("Card Mount Failed");
         ilog_no_sdcard = true;
-        SD.end();
         return;
     }
 
@@ -732,7 +756,6 @@ void ilog_sd_store() {
     if (cardType == CARD_NONE) {
         Serial.println("No SD card attached");
         ilog_no_sdcard = true;
-        SD.end();
         return;
     }
 
@@ -745,7 +768,6 @@ void ilog_sd_store() {
     if (!file) {
         Serial.println("Failed to open file for writing");
         ilog_no_sdcard = true;
-        SD.end();
         return;
     }
 
@@ -762,8 +784,6 @@ void ilog_sd_store() {
 
     ilog_no_sdcard = false;
     ilog_sdcard_empty = false;
-
-    SD.end();
 }
 
 void ilog_sd_push() {
@@ -776,7 +796,7 @@ void ilog_sd_push() {
     if (last_check > now)
         return;
 
-    last_check = now + 10000;
+    last_check = now + 1000;
 
     /**************************************************************************/
 
@@ -788,7 +808,7 @@ void ilog_sd_push() {
             return;
     }
 
-    if (!SD.begin(5)) {
+    if (ilog_no_sdcard && !SD.begin(5)) {
         Serial.println("Card Mount Failed");
         ilog_no_sdcard = true;
         return;
@@ -1023,14 +1043,6 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
         pid_Kd_last = pid_Kd;
         pid0.SetTunings(pid_Kp, pid_Ki, pid_Kd);
         pid1.SetTunings(pid_Kp, pid_Ki, pid_Kd);
-    }
-    else if (strcmp(topic, temp0_topic) == 0) {
-        payload[length] = 0;
-        temp0 = atof(reinterpret_cast<const char*>(payload));
-    }
-    else if (strcmp(topic, temp1_topic) == 0) {
-        payload[length] = 0;
-        temp1 = atof(reinterpret_cast<const char*>(payload));
     }
 }
 
