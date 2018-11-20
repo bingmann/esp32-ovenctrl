@@ -20,29 +20,6 @@ IPAddress wifi_ap_ip(192, 168, 4, 1); // The IP address of the access point
 static const bool g_ofen_simulator = true;
 
 /******************************************************************************/
-// LockMutexGuard
-
-class LockMutexGuard {
-public:
-    LockMutexGuard(SemaphoreHandle_t& mutex) : mutex_(mutex), locked_(true) {
-        lock();
-    }
-
-    ~LockMutexGuard() {
-        if (locked_)
-            unlock();
-    }
-
-    void lock() { xSemaphoreTake(mutex_, portMAX_DELAY); };
-
-    void unlock() { xSemaphoreGive(mutex_); }
-
-private:
-    SemaphoreHandle_t& mutex_;
-    bool locked_;
-};
-
-/******************************************************************************/
 // ArduinoOTA
 
 #include <ArduinoOTA.h>
@@ -176,37 +153,27 @@ float temperatureRead();
 void ilog_sd_store();
 void ilog_sd_push();
 
-void spi_main(void*) {
-    SPI.begin();
+void spi_poll(unsigned long now) {
+    static unsigned long last_check = 0;
+    if (last_check > now)
+        return;
+    last_check = now + 500;
 
-    while (true) {
-        if (g_ofen_simulator) {
-            double temp0 = thermocouple0.readCelsius();
-            double temp1 = thermocouple1.readCelsius();
-        }
-        else {
-            temp0 = thermocouple0.readCelsius();
-            temp1 = thermocouple1.readCelsius();
-        }
-        temp_esp = temperatureRead();
-
-        ilog_sd_store();
-        ilog_sd_push();
-
-        vTaskDelay(500 / portTICK_PERIOD_MS);
+    if (g_ofen_simulator) {
+        double temp0 = thermocouple0.readCelsius();
+        double temp1 = thermocouple1.readCelsius();
     }
+    else {
+        temp0 = thermocouple0.readCelsius();
+        temp1 = thermocouple1.readCelsius();
+    }
+    temp_esp = temperatureRead();
+
+    ilog_sd_store();
+    ilog_sd_push();
 }
 
-void spi_setup() {
-    xTaskCreatePinnedToCore(&spi_main, // function
-        "spi_main",                    // name
-        8192,                          // stack
-        NULL,                          // void* to input parameter
-        10,                            // priority
-        NULL,                          // task handle
-        0                              // core
-    );
-}
+void spi_setup() { SPI.begin(); }
 
 /******************************************************************************/
 // Relais Pins
@@ -269,25 +236,23 @@ void IRAM_ATTR on_button_down1() {
     }
 }
 
-void buttons_main(void*) {
-    while (true) {
-        isr_ts = millis();
+void buttons_poll(unsigned long now) {
+    static unsigned long last_check = 0;
+    if (last_check > now)
+        return;
+    last_check = now + 500;
 
-        if (digitalRead(button_up0_pin) == LOW) {
-            on_target_temp_up(target_temp0);
-        }
-        if (digitalRead(button_down0_pin) == LOW) {
-            on_target_temp_down(target_temp0);
-        }
-        if (digitalRead(button_up1_pin) == LOW) {
-            on_target_temp_up(target_temp1);
-        }
-        if (digitalRead(button_down1_pin) == LOW) {
-            on_target_temp_down(target_temp1);
-        }
-
-        // wait / yield time to other tasks
-        vTaskDelay(500 / portTICK_PERIOD_MS);
+    if (digitalRead(button_up0_pin) == LOW) {
+        on_target_temp_up(target_temp0);
+    }
+    if (digitalRead(button_down0_pin) == LOW) {
+        on_target_temp_down(target_temp0);
+    }
+    if (digitalRead(button_up1_pin) == LOW) {
+        on_target_temp_up(target_temp1);
+    }
+    if (digitalRead(button_down1_pin) == LOW) {
+        on_target_temp_down(target_temp1);
     }
 }
 
@@ -310,15 +275,6 @@ void buttons_setup() {
         digitalPinToInterrupt(button_up1_pin), on_button_up1, FALLING);
     attachInterrupt(
         digitalPinToInterrupt(button_down1_pin), on_button_down1, FALLING);
-
-    xTaskCreatePinnedToCore(&buttons_main, // function
-        "buttons_main",                    // name
-        1024,                              // stack
-        NULL,                              // void* to input parameter
-        10,                                // priority
-        NULL,                              // task handle
-        0                                  // core
-    );
 }
 
 /******************************************************************************/
@@ -336,6 +292,9 @@ void IRAM_ATTR on_opto1() { opto1_state = digitalRead(opto1_pin); }
 void opto_setup() {
     pinMode(opto0_pin, INPUT_PULLUP);
     pinMode(opto1_pin, INPUT_PULLUP);
+
+    opto0_state = digitalRead(opto0_pin);
+    opto1_state = digitalRead(opto1_pin);
 
     attachInterrupt(digitalPinToInterrupt(opto0_pin), on_opto0, CHANGE);
     attachInterrupt(digitalPinToInterrupt(opto1_pin), on_opto1, CHANGE);
@@ -381,7 +340,12 @@ void pid_setup() {
 
 const unsigned speed = 1;
 
-void pid_poll() {
+void pid_poll(unsigned long now) {
+    static unsigned long last_check = 0;
+    if (last_check > now)
+        return;
+    last_check = now + 1000;
+
     static std::deque<bool> pid0_heat = {
         false, false, false, false, false, false};
     static std::deque<bool> pid1_heat = {
@@ -447,8 +411,6 @@ void pid_poll() {
 
 #include <PubSubClient.h>
 #include <WiFiClientSecure.h>
-
-SemaphoreHandle_t mqtt_mutex;
 
 const char* mqtt_id = "pizza_control";
 const char* mqtt_user = "pizza";
@@ -538,8 +500,6 @@ void mqtt_connect(unsigned long now) {
 #include <NTPClient.h>
 #include <WiFiUdp.h>
 
-SemaphoreHandle_t i2c_mutex;
-
 // RTC module
 DS3231 ds_rtc;
 unsigned long ds_rtc_now = 0;
@@ -561,8 +521,6 @@ unsigned long long rtc_epoch_millis() {
 }
 
 void ntp_setup() {
-    LockMutexGuard lock(i2c_mutex);
-
     // read initial date/time
     DateTime dt = RTClib::now();
     ds_rtc_millis = millis();
@@ -594,8 +552,6 @@ void ntp_poll() {
 
         ntp_update_done = true;
 
-        LockMutexGuard lock(i2c_mutex);
-
         DateTime tm(ts);
         ds_rtc.setClockMode(/* 24-hour */ false);
         ds_rtc.setYear(tm.year() - 2000);
@@ -625,51 +581,48 @@ static LogEntry ilog_list[ilog_size];
 static size_t ilog_pos = 0;
 
 const size_t ilog_pos_push = 2;
-const size_t ilog_pos_store = 60;
+const size_t ilog_pos_store = 10;
 
-bool ilog_no_sdcard = false;
+bool ilog_use_sdcard = false;
 bool ilog_sdcard_empty = false;
 
-SemaphoreHandle_t ilog_mutex;
+void ilog_poll(unsigned long now) {
+    static unsigned long last_check = 0;
+    if (last_check > now)
+        return;
+    last_check = now + 1000;
 
-void ilog_main(void*) {
+    long long ts = rtc_epoch_millis();
+    if (ts >= 1000000) {
+        // create new log entry
 
-    while (true) {
-        long long ts = rtc_epoch_millis();
-        if (ts >= 1000000) {
-            // create new log entry
-            LockMutexGuard lock(ilog_mutex);
+        if (ilog_pos < ilog_size) {
+            LogEntry& e = ilog_list[ilog_pos++];
+            Serial.print("filling ");
+            Serial.println(ilog_pos - 1);
 
-            if (ilog_pos < ilog_size) {
-                LogEntry& e = ilog_list[ilog_pos++];
-                Serial.print("filling ");
-                Serial.println(ilog_pos - 1);
-
-                e.ts = ts;
-                e.temp0 = temp0, e.temp1 = temp1;
-                e.temp_esp = temp_esp;
-                e.target_temp0 = target_temp0, e.target_temp1 = target_temp1;
-                e.opto0_state = opto0_state, e.opto1_state = opto1_state;
-                e.pid_Kp = pid_Kp, e.pid_Ki = pid_Ki, e.pid_Kd = pid_Kd;
-                e.pid0 = pid0_output, e.pid1 = pid1_output;
-            }
+            e.ts = ts;
+            e.temp0 = temp0, e.temp1 = temp1;
+            e.temp_esp = temp_esp;
+            e.target_temp0 = target_temp0, e.target_temp1 = target_temp1;
+            e.opto0_state = opto0_state, e.opto1_state = opto1_state;
+            e.pid_Kp = pid_Kp, e.pid_Ki = pid_Ki, e.pid_Kd = pid_Kd;
+            e.pid0 = pid0_output, e.pid1 = pid1_output;
         }
-
-        vTaskDelay(1000 / portTICK_PERIOD_MS);
     }
 }
 
-void ilog_push() {
-    LockMutexGuard lock(ilog_mutex);
+void ilog_poll_push(unsigned long now) {
+    static unsigned long last_check = 0;
+    if (last_check > now)
+        return;
+    last_check = now + 100;
 
     if (ilog_pos < ilog_pos_push)
         return;
 
-    {
-        LockMutexGuard lock(mqtt_mutex);
-        if (!mqtt_client.connected())
-            return;
-    }
+    if (!mqtt_client.connected())
+        return;
 
     static char buffer[1 * 768];
     size_t out = 0;
@@ -720,12 +673,9 @@ void ilog_push() {
     Serial.print("out ");
     Serial.println(out);
 
-    {
-        LockMutexGuard lock(mqtt_mutex);
-        if (!mqtt_client.publish("pizza/influx_data", (uint8_t*)buffer, out,
-                /* retain */ false))
-            return;
-    }
+    if (!mqtt_client.publish("pizza/influx_data", (uint8_t*)buffer, out,
+            /* retain */ false))
+        return;
 
     memmove(ilog_list, ilog_list + ilog_use,
         (ilog_pos - ilog_use) * sizeof(ilog_list[0]));
@@ -733,13 +683,6 @@ void ilog_push() {
 
     Serial.print("remain ");
     Serial.println(ilog_pos);
-}
-
-void ilog_push_loop(void*) {
-    while (true) {
-        ilog_push();
-        vTaskDelay(100 / portTICK_PERIOD_MS);
-    }
 }
 
 void ilog_sd_store() {
@@ -756,24 +699,20 @@ void ilog_sd_store() {
 
     /**************************************************************************/
 
-    LockMutexGuard lock(ilog_mutex);
-    LockMutexGuard lock_i2c(i2c_mutex);
-
     if (ilog_pos < ilog_pos_store)
         return;
 
     uint32_t start = millis();
 
-    if (ilog_no_sdcard && !SD.begin(5)) {
+    if (!ilog_use_sdcard && !SD.begin(5)) {
         Serial.println("Card Mount Failed");
-        ilog_no_sdcard = true;
         return;
     }
 
     uint8_t cardType = SD.cardType();
     if (cardType == CARD_NONE) {
         Serial.println("No SD card attached");
-        ilog_no_sdcard = true;
+        ilog_use_sdcard = false;
         return;
     }
 
@@ -785,7 +724,7 @@ void ilog_sd_store() {
     File file = SD.open(filename, FILE_WRITE);
     if (!file) {
         Serial.println("Failed to open file for writing");
-        ilog_no_sdcard = true;
+        ilog_use_sdcard = false;
         return;
     }
 
@@ -800,7 +739,7 @@ void ilog_sd_store() {
 
     ilog_pos = 0;
 
-    ilog_no_sdcard = false;
+    ilog_use_sdcard = true;
     ilog_sdcard_empty = false;
 }
 
@@ -824,36 +763,30 @@ void ilog_sd_push() {
 
     uint32_t start = millis();
 
-    {
-        LockMutexGuard lock(mqtt_mutex);
-        if (!mqtt_client.connected())
-            return;
-    }
+    if (!mqtt_client.connected())
+        return;
 
-    LockMutexGuard lock_i2c(i2c_mutex);
-
-    if (ilog_no_sdcard && !SD.begin(5)) {
+    if (!ilog_use_sdcard && !SD.begin(5)) {
         Serial.println("Card Mount Failed");
-        ilog_no_sdcard = true;
         return;
     }
 
     uint8_t cardType = SD.cardType();
     if (cardType == CARD_NONE) {
         Serial.println("No SD card attached");
-        ilog_no_sdcard = true;
+        ilog_use_sdcard = false;
         return;
     }
 
     File root = SD.open("/");
     if (!root) {
         Serial.println("Failed to open root directory");
-        ilog_no_sdcard = true;
+        ilog_use_sdcard = false;
         return;
     }
     if (!root.isDirectory()) {
         Serial.println("Root is not a directory");
-        ilog_no_sdcard = true;
+        ilog_use_sdcard = false;
         return;
     }
 
@@ -866,8 +799,6 @@ void ilog_sd_push() {
             Serial.print(file.name());
             Serial.print("  SIZE: ");
             Serial.println(file.size());
-
-            LockMutexGuard lock(ilog_mutex);
 
             if (strncmp(file.name(), "/log-", 5) == 0 &&
                 file.size() % sizeof(LogEntry) == 0 &&
@@ -891,32 +822,12 @@ void ilog_sd_push() {
     }
 
     Serial.printf("ilog_sd_push() done in %u ms\n",
-                  static_cast<unsigned>(millis() - start));
+        static_cast<unsigned>(millis() - start));
 
-    ilog_no_sdcard = false;
+    ilog_use_sdcard = true;
 
     if (count == 0)
         ilog_sdcard_empty = true;
-}
-
-void ilog_setup() {
-    xTaskCreatePinnedToCore(&ilog_main, // function
-        "ilog_main",                    // name
-        1024,                           // stack
-        NULL,                           // void* to input parameter
-        10,                             // priority
-        NULL,                           // task handle
-        0                               // core
-    );
-
-    xTaskCreatePinnedToCore(&ilog_push_loop, // function
-        "ilog_push_loop",                    // name
-        8192,                                // stack
-        NULL,                                // void* to input parameter
-        10,                                  // priority
-        NULL,                                // task handle
-        0                                    // core
-    );
 }
 
 /******************************************************************************/
@@ -927,65 +838,49 @@ void ilog_setup() {
 // set the LCD address to 0x27 for a 16 chars and 2 line display
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 
-void lcd_main(void*) {
+void lcd_poll(unsigned long now) {
     static char buffer0[32], buffer1[32];
     static unsigned ticker = 0;
 
-    {
-        LockMutexGuard lock(i2c_mutex);
+    static unsigned long last_check = 0;
+    if (last_check > now)
+        return;
+    last_check = now + 500;
 
-        // initialize the LCD via pins 21, 22
-        lcd.begin();
+    unsigned xtemp0 = temp0;
+    if (xtemp0 >= 10000)
+        xtemp0 = 9999;
 
-        // Print a message to the LCD.
-        lcd.backlight();
-        lcd.clear();
-        lcd.print("Initializing...");
-    }
+    snprintf(buffer0, sizeof(buffer0), "%4u/%3uC   %4d", xtemp0, target_temp0,
+        ticker);
 
-    vTaskDelay(1000 / portTICK_PERIOD_MS);
+    unsigned xtemp1 = temp1;
+    if (xtemp1 >= 10000)
+        xtemp1 = 9999;
 
-    while (true) {
-        unsigned xtemp0 = temp0;
-        if (xtemp0 >= 10000)
-            xtemp0 = 9999;
+    snprintf(buffer1, sizeof(buffer1), "%4u/%3uC %c%c%c%c%c%c", xtemp1,
+        target_temp1, WiFi.status() == WL_CONNECTED ? 'W' : 'w',
+        ntp_update_done ? 'N' : 'n', mqtt_connected ? 'M' : 'm',
+             ilog_use_sdcard ? (ilog_sdcard_empty ? 'E' : 'S') : 's',
+             opto0_state ? '-' : 'O',
+             opto1_state ? '-' : 'O');
 
-        snprintf(buffer0, sizeof(buffer0), "%4u/%3uC   %4d", xtemp0,
-            target_temp0, ticker);
+    ticker = (ticker + 1) % 10000;
 
-        unsigned xtemp1 = temp1;
-        if (xtemp1 >= 10000)
-            xtemp1 = 9999;
-
-        snprintf(buffer1, sizeof(buffer1), "%4u/%3uC %c%c", xtemp1, target_temp1,
-                 WiFi.status() == WL_CONNECTED ? 'W' : 'w',
-                 mqtt_connected ? 'M' : 'm');
-
-        ticker = (ticker + 1) % 10000;
-
-        {
-            LockMutexGuard lock(i2c_mutex);
-
-            lcd.setCursor(0, 0);
-            lcd.print(buffer0);
-            lcd.setCursor(0, 1);
-            lcd.print(buffer1);
-        }
-
-        // wait / yield time to other tasks
-        vTaskDelay(500 / portTICK_PERIOD_MS);
-    }
+    lcd.setCursor(0, 0);
+    lcd.print(buffer0);
+    lcd.setCursor(0, 1);
+    lcd.print(buffer1);
 }
 
 void lcd_setup() {
-    xTaskCreatePinnedToCore(&lcd_main, // function
-        "lcd_main",                    // name
-        2 * 1024,                      // stack
-        NULL,                          // void* to input parameter
-        10,                            // priority
-        NULL,                          // task handle
-        0                              // core
-    );
+    // initialize the LCD via pins 21, 22
+    lcd.begin();
+
+    // Print a message to the LCD.
+    lcd.backlight();
+    lcd.clear();
+    lcd.print("Initializing...");
 }
 
 /******************************************************************************/
@@ -1081,8 +976,6 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
 }
 
 void mqtt_poll(unsigned long now) {
-    LockMutexGuard lock(mqtt_mutex);
-
     char msg[32];
 
     /* if mqtt_client was disconnected then try to reconnect again */
@@ -1135,72 +1028,14 @@ void mqtt_poll(unsigned long now) {
 }
 
 /******************************************************************************/
-// Controller Task Thread
-
-void task_main(void*) {
-    while (true) {
-        pid_poll();
-
-        // wait / yield time to other tasks
-        vTaskDelay(1000 / portTICK_PERIOD_MS);
-    }
-}
-
-void task_setup() {
-    pid_setup();
-
-    xTaskCreatePinnedToCore(&task_main, // function
-        "task_main",                    // name
-        2048,                           // stack
-        NULL,                           // void* to input parameter
-        10,                             // priority
-        NULL,                           // task handle
-        0                               // core
-    );
-}
-
-/******************************************************************************/
-
-void wifi_loop(void*) {
-    while (true) {
-        unsigned long now = millis();
-
-        wifi_poll(now);
-        ota_poll();
-        // mqtt_poll(now);
-        ntp_poll();
-
-        // wait / yield time to other tasks
-        vTaskDelay(250 / portTICK_PERIOD_MS);
-    }
-}
-
-void wifi_loop_start() {
-    xTaskCreatePinnedToCore(&wifi_loop, // function
-        "wifi_loop",                    // name
-        8192,                           // stack
-        NULL,                           // void* to input parameter
-        10,                             // priority
-        NULL,                           // task handle
-        0                               // core
-    );
-}
-
-/******************************************************************************/
 // main
 
 void setup() {
     Serial.begin(115200);
     Serial.println("Booting");
 
-    i2c_mutex = xSemaphoreCreateMutex();
-    xSemaphoreGive(i2c_mutex);
-
-    mqtt_mutex = xSemaphoreCreateMutex();
-    xSemaphoreGive(mqtt_mutex);
-
-    ilog_mutex = xSemaphoreCreateMutex();
-    xSemaphoreGive(ilog_mutex);
+    Wire.begin();
+    Wire.setTimeOut(1000);
 
     lcd_setup();
 
@@ -1209,19 +1044,29 @@ void setup() {
     ota_setup();
     mqtt_setup();
     ntp_setup();
-    wifi_loop_start();
 
-    ilog_setup();
-    buttons_setup();
-    // opto_setup();
     spi_setup();
-
-    task_setup();
+    buttons_setup();
+    opto_setup();
+    pid_setup();
 }
 
 void loop() {
-    // wait / yield time to other tasks
-    vTaskDelay(5000 / portTICK_PERIOD_MS);
+    unsigned long now = millis();
+
+    lcd_poll(now);
+
+    wifi_poll(now);
+    ota_poll();
+    mqtt_poll(now);
+    ntp_poll();
+
+    spi_poll(now);
+    buttons_poll(now);
+    pid_poll(now);
+    ilog_poll(now);
+
+    ilog_poll_push(now);
 }
 
 /******************************************************************************/
