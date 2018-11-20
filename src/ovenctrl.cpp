@@ -17,6 +17,8 @@ const char* wifi_ap_pass = "pizzaoven";
 const char* dnsName = "pizza";        // Domain name for the mDNS responder
 IPAddress wifi_ap_ip(192, 168, 4, 1); // The IP address of the access point
 
+static const bool g_ofen_simulator = true;
+
 /******************************************************************************/
 // LockMutexGuard
 
@@ -143,10 +145,10 @@ void mdns_setup() { // Start the mDNS responder
 /******************************************************************************/
 // MAX6675 Thermocouple
 
-#include <MAX6675.h>
-#include <SPI.h>
 #include <FS.h>
+#include <MAX6675.h>
 #include <SD.h>
+#include <SPI.h>
 
 const int spi_sck_pin = 18;
 const int spi_so_pin = 19;
@@ -175,11 +177,17 @@ void ilog_sd_store();
 void ilog_sd_push();
 
 void spi_main(void*) {
-    int loop = 0;
+    SPI.begin();
 
     while (true) {
-        temp0 = thermocouple0.readCelsius();
-        temp1 = thermocouple1.readCelsius();
+        if (g_ofen_simulator) {
+            double temp0 = thermocouple0.readCelsius();
+            double temp1 = thermocouple1.readCelsius();
+        }
+        else {
+            temp0 = thermocouple0.readCelsius();
+            temp1 = thermocouple1.readCelsius();
+        }
         temp_esp = temperatureRead();
 
         ilog_sd_store();
@@ -190,30 +198,29 @@ void spi_main(void*) {
 }
 
 void spi_setup() {
-    SPI.begin();
-
-    xTaskCreate(&spi_main, // function
-        "spi_main",        // name
-        8192,              // stack
-        NULL,              // void* to input parameter
-        10,                // priority
-        NULL               // task handle
+    xTaskCreatePinnedToCore(&spi_main, // function
+        "spi_main",                    // name
+        8192,                          // stack
+        NULL,                          // void* to input parameter
+        10,                            // priority
+        NULL,                          // task handle
+        0                              // core
     );
 }
 
 /******************************************************************************/
 // Relais Pins
 
-const int relay0_pin = 4;
-const int relay1_pin = 2;
+const int relay0_pin = 2;
+const int relay1_pin = 4;
 
 /******************************************************************************/
 // Buttons
 
-const int button_up0_pin = 12;
-const int button_down0_pin = 14;
-const int button_up1_pin = 26;
-const int button_down1_pin = 27;
+const int button_up0_pin = 14;
+const int button_down0_pin = 12;
+const int button_up1_pin = 27;
+const int button_down1_pin = 26;
 
 volatile unsigned target_temp0 = 0;
 volatile unsigned target_temp1 = 0;
@@ -266,9 +273,6 @@ void buttons_main(void*) {
     while (true) {
         isr_ts = millis();
 
-        target_temp0 = 200;
-        target_temp1 = 200;
-
         if (digitalRead(button_up0_pin) == LOW) {
             on_target_temp_up(target_temp0);
         }
@@ -307,12 +311,13 @@ void buttons_setup() {
     attachInterrupt(
         digitalPinToInterrupt(button_down1_pin), on_button_down1, FALLING);
 
-    xTaskCreate(&buttons_main, // function
-        "buttons_main",        // name
-        1024,                  // stack
-        NULL,                  // void* to input parameter
-        10,                    // priority
-        NULL                   // task handle
+    xTaskCreatePinnedToCore(&buttons_main, // function
+        "buttons_main",                    // name
+        1024,                              // stack
+        NULL,                              // void* to input parameter
+        10,                                // priority
+        NULL,                              // task handle
+        0                                  // core
     );
 }
 
@@ -367,14 +372,23 @@ void pid_setup() {
     pid1.SetMode(AUTOMATIC);
     // output range 0-1
     pid1.SetOutputLimits(0.0, 1.0);
+
+    if (g_ofen_simulator) {
+        target_temp0 = 200;
+        target_temp1 = 200;
+    }
 }
 
 const unsigned speed = 1;
 
 void pid_poll() {
-    if (0) {
+    static std::deque<bool> pid0_heat = {
+        false, false, false, false, false, false};
+    static std::deque<bool> pid1_heat = {
+        false, false, false, false, false, false};
+
+    if (g_ofen_simulator) {
         // ofen simulator
-        static std::deque<bool> pid0_heat = { false, false, false, false, false, false };
         temp0 += pid0_heat.front() * 0.3 * speed;
         for (size_t i = 0; i < speed; ++i) {
             temp0 *= (1.0 - 0.000052);
@@ -382,23 +396,24 @@ void pid_poll() {
         if (random(2200) < 8 * speed && temp0 > 30)
             temp0 -= 30;
 
-        static std::deque<bool> pid1_heat = { false, false, false, false, false, false };
         temp1 += pid1_heat.front() * 0.3 * speed;
         for (size_t i = 0; i < speed; ++i) {
             temp1 *= (1.0 - 0.000052);
         }
-        if (random(2200) < 8 * speed  && temp1 > 30)
+        if (random(2200) < 8 * speed && temp1 > 30)
             temp1 -= 30;
     }
 
     static unsigned round = 5;
     if (round-- == 0) {
         round = 5;
-        // pid0_heat.pop_front();
-        // pid0_heat.push_back(pid0_output >= 0.5);
+        if (g_ofen_simulator) {
+            pid0_heat.pop_front();
+            pid0_heat.push_back(pid0_output >= 0.5);
 
-        // pid1_heat.pop_front();
-        // pid1_heat.push_back(pid1_output >= 0.5);
+            pid1_heat.pop_front();
+            pid1_heat.push_back(pid1_output >= 0.5);
+        }
 
         pid0_input = temp0;
         pid0_target = target_temp0;
@@ -469,16 +484,18 @@ const char* mqtt_ca_cert =
     "-----END CERTIFICATE-----";
 
 /* create an instance of WiFiClientSecure */
-//WiFiClientSecure mqtt_wifi_client;
+// WiFiClientSecure mqtt_wifi_client;
 WiFiClient mqtt_wifi_client;
 PubSubClient mqtt_client(mqtt_wifi_client);
 
 void mqtt_callback(char* topic, byte* payload, unsigned int length);
 void mqtt_subscribe();
 
+bool mqtt_connected = false;
+
 void mqtt_setup() {
     /* set SSL/TLS certificate */
-    //mqtt_wifi_client.setCACert(mqtt_ca_cert);
+    // mqtt_wifi_client.setCACert(mqtt_ca_cert);
     /* configure the MQTT server with IP address and port */
     mqtt_client.setServer("panthema.net", 1883);
     // mqtt_callback function will be invoked when subscribed topic are received
@@ -497,16 +514,20 @@ void mqtt_connect(unsigned long now) {
     Serial.print("MQTT connecting ...");
     /* connect now */
     if (mqtt_client.connect(mqtt_id, mqtt_user, mqtt_passwd,
-                            /* willTopic */ nullptr, /* willQos */ MQTTQOS2,
-                            /* willRetain */ true, /* willMessage */ nullptr)) {
+            /* willTopic */ nullptr, /* willQos */ MQTTQOS2,
+            /* willRetain */ true, /* willMessage */ nullptr)) {
         Serial.println("connected");
         /* subscribe topics */
         mqtt_subscribe();
+
+        mqtt_connected = true;
     }
     else {
         Serial.print("failed, status code =");
         Serial.print(mqtt_client.state());
         Serial.println("try again in 5 seconds");
+
+        mqtt_connected = false;
     }
 }
 
@@ -541,9 +562,6 @@ unsigned long long rtc_epoch_millis() {
 
 void ntp_setup() {
     LockMutexGuard lock(i2c_mutex);
-
-    // Start the I2C interface
-    Wire.begin();
 
     // read initial date/time
     DateTime dt = RTClib::now();
@@ -653,7 +671,7 @@ void ilog_push() {
             return;
     }
 
-    static char buffer[1*768];
+    static char buffer[1 * 768];
     size_t out = 0;
 
     size_t ilog_use;
@@ -678,9 +696,8 @@ void ilog_push() {
         dtostrf(e.pid0, 0, 2, buffer_pid0);
         dtostrf(e.pid1, 0, 2, buffer_pid1);
 
-        int a = snprintf(
-            buffer + out, sizeof(buffer) - out,
-            "pizza temp0=%s,temp1=%s,"
+        int a = snprintf(buffer + out, sizeof(buffer) - out,
+            "pizza_gluehpn18 temp0=%s,temp1=%s,"
             "target_temp0=%u,target_temp1=%u,"
             "temp_esp=%s,"
             "opto0=%u,opto1=%u,"
@@ -705,14 +722,13 @@ void ilog_push() {
 
     {
         LockMutexGuard lock(mqtt_mutex);
-        if (!mqtt_client.publish(
-                "pizza/influx_data", (uint8_t*)buffer, out,
+        if (!mqtt_client.publish("pizza/influx_data", (uint8_t*)buffer, out,
                 /* retain */ false))
             return;
     }
 
     memmove(ilog_list, ilog_list + ilog_use,
-            (ilog_pos - ilog_use) * sizeof(ilog_list[0]));
+        (ilog_pos - ilog_use) * sizeof(ilog_list[0]));
     ilog_pos -= ilog_use;
 
     Serial.print("remain ");
@@ -734,15 +750,17 @@ void ilog_sd_store() {
         return;
 
     last_check = now + 2000;
-    return;
+
+    // to disable logging:
+    // return;
 
     /**************************************************************************/
 
     LockMutexGuard lock(ilog_mutex);
+    LockMutexGuard lock_i2c(i2c_mutex);
 
     if (ilog_pos < ilog_pos_store)
         return;
-
 
     uint32_t start = millis();
 
@@ -788,7 +806,8 @@ void ilog_sd_store() {
 
 void ilog_sd_push() {
 
-    if (ilog_sdcard_empty) return;
+    if (ilog_sdcard_empty)
+        return;
 
     unsigned long now = millis();
 
@@ -797,6 +816,9 @@ void ilog_sd_push() {
         return;
 
     last_check = now + 1000;
+
+    // to disable logging:
+    // return;
 
     /**************************************************************************/
 
@@ -807,6 +829,8 @@ void ilog_sd_push() {
         if (!mqtt_client.connected())
             return;
     }
+
+    LockMutexGuard lock_i2c(i2c_mutex);
 
     if (ilog_no_sdcard && !SD.begin(5)) {
         Serial.println("Card Mount Failed");
@@ -847,8 +871,7 @@ void ilog_sd_push() {
 
             if (strncmp(file.name(), "/log-", 5) == 0 &&
                 file.size() % sizeof(LogEntry) == 0 &&
-                ilog_pos + file.size() / sizeof(LogEntry) + 16 < ilog_size)
-            {
+                ilog_pos + file.size() / sizeof(LogEntry) + 16 < ilog_size) {
                 file.read((uint8_t*)(ilog_list + ilog_pos), file.size());
                 ilog_pos += file.size() / sizeof(LogEntry);
 
@@ -868,7 +891,7 @@ void ilog_sd_push() {
     }
 
     Serial.printf("ilog_sd_push() done in %u ms\n",
-                  millis() - start);
+                  static_cast<unsigned>(millis() - start));
 
     ilog_no_sdcard = false;
 
@@ -877,20 +900,22 @@ void ilog_sd_push() {
 }
 
 void ilog_setup() {
-    xTaskCreate(&ilog_main, // function
-        "ilog_main",        // name
-        1024,               // stack
-        NULL,               // void* to input parameter
-        10,                 // priority
-        NULL                // task handle
+    xTaskCreatePinnedToCore(&ilog_main, // function
+        "ilog_main",                    // name
+        1024,                           // stack
+        NULL,                           // void* to input parameter
+        10,                             // priority
+        NULL,                           // task handle
+        0                               // core
     );
 
-    xTaskCreate(&ilog_push_loop, // function
-        "ilog_push_loop",        // name
-        8192,                    // stack
-        NULL,                    // void* to input parameter
-        10,                      // priority
-        NULL                     // task handle
+    xTaskCreatePinnedToCore(&ilog_push_loop, // function
+        "ilog_push_loop",                    // name
+        8192,                                // stack
+        NULL,                                // void* to input parameter
+        10,                                  // priority
+        NULL,                                // task handle
+        0                                    // core
     );
 }
 
@@ -903,24 +928,40 @@ void ilog_setup() {
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 
 void lcd_main(void*) {
-    char buffer0[32], buffer1[32];
+    static char buffer0[32], buffer1[32];
+    static unsigned ticker = 0;
+
+    {
+        LockMutexGuard lock(i2c_mutex);
+
+        // initialize the LCD via pins 21, 22
+        lcd.begin();
+
+        // Print a message to the LCD.
+        lcd.backlight();
+        lcd.clear();
+        lcd.print("Initializing...");
+    }
+
+    vTaskDelay(1000 / portTICK_PERIOD_MS);
 
     while (true) {
         unsigned xtemp0 = temp0;
         if (xtemp0 >= 10000)
             xtemp0 = 9999;
 
-        snprintf(buffer0, sizeof(buffer0), "%4u/%3uC %c %s", xtemp0,
-            target_temp0, opto0_state ? 'C' : 'O',
-            WiFi.status() == WL_CONNECTED ? "Wifi" : "NoWF");
+        snprintf(buffer0, sizeof(buffer0), "%4u/%3uC   %4d", xtemp0,
+            target_temp0, ticker);
 
         unsigned xtemp1 = temp1;
         if (xtemp1 >= 10000)
             xtemp1 = 9999;
 
-        snprintf(buffer1, sizeof(buffer1), "%4u/%3uC %c %s", xtemp1,
-            target_temp1, opto1_state ? 'C' : 'O',
-                 ilog_no_sdcard ? "NoSD" : "SD");
+        snprintf(buffer1, sizeof(buffer1), "%4u/%3uC %c%c", xtemp1, target_temp1,
+                 WiFi.status() == WL_CONNECTED ? 'W' : 'w',
+                 mqtt_connected ? 'M' : 'm');
+
+        ticker = (ticker + 1) % 10000;
 
         {
             LockMutexGuard lock(i2c_mutex);
@@ -937,22 +978,13 @@ void lcd_main(void*) {
 }
 
 void lcd_setup() {
-    LockMutexGuard lock(i2c_mutex);
-
-    // initialize the LCD via pins 21, 22
-    lcd.begin();
-
-    // Print a message to the LCD.
-    lcd.backlight();
-    lcd.clear();
-    lcd.print("Initializing...");
-
-    xTaskCreate(&lcd_main, // function
-        "lcd_main",        // name
-        2048,              // stack
-        NULL,              // void* to input parameter
-        10,                // priority
-        NULL               // task handle
+    xTaskCreatePinnedToCore(&lcd_main, // function
+        "lcd_main",                    // name
+        2 * 1024,                      // stack
+        NULL,                          // void* to input parameter
+        10,                            // priority
+        NULL,                          // task handle
+        0                              // core
     );
 }
 
@@ -999,8 +1031,10 @@ void mqtt_subscribe() {
     mqtt_client.subscribe(pid_Ki_topic);
     mqtt_client.subscribe(pid_Kd_topic);
 
-    mqtt_client.subscribe(temp0_topic);
-    mqtt_client.subscribe(temp1_topic);
+    if (g_ofen_simulator) {
+        mqtt_client.subscribe(temp0_topic);
+        mqtt_client.subscribe(temp1_topic);
+    }
 }
 
 void mqtt_callback(char* topic, byte* payload, unsigned int length) {
@@ -1115,12 +1149,40 @@ void task_main(void*) {
 void task_setup() {
     pid_setup();
 
-    xTaskCreate(&task_main, // function
-        "task_main",        // name
-        2048,               // stack
-        NULL,               // void* to input parameter
-        10,                 // priority
-        NULL                // task handle
+    xTaskCreatePinnedToCore(&task_main, // function
+        "task_main",                    // name
+        2048,                           // stack
+        NULL,                           // void* to input parameter
+        10,                             // priority
+        NULL,                           // task handle
+        0                               // core
+    );
+}
+
+/******************************************************************************/
+
+void wifi_loop(void*) {
+    while (true) {
+        unsigned long now = millis();
+
+        wifi_poll(now);
+        ota_poll();
+        // mqtt_poll(now);
+        ntp_poll();
+
+        // wait / yield time to other tasks
+        vTaskDelay(250 / portTICK_PERIOD_MS);
+    }
+}
+
+void wifi_loop_start() {
+    xTaskCreatePinnedToCore(&wifi_loop, // function
+        "wifi_loop",                    // name
+        8192,                           // stack
+        NULL,                           // void* to input parameter
+        10,                             // priority
+        NULL,                           // task handle
+        0                               // core
     );
 }
 
@@ -1147,24 +1209,19 @@ void setup() {
     ota_setup();
     mqtt_setup();
     ntp_setup();
+    wifi_loop_start();
 
     ilog_setup();
     buttons_setup();
-    opto_setup();
+    // opto_setup();
     spi_setup();
 
     task_setup();
 }
 
 void loop() {
-    unsigned long now = millis();
-
-    wifi_poll(now);
-    ota_poll();
-    mqtt_poll(now);
-    ntp_poll();
-
-    vTaskDelay(250 / portTICK_PERIOD_MS);
+    // wait / yield time to other tasks
+    vTaskDelay(5000 / portTICK_PERIOD_MS);
 }
 
 /******************************************************************************/
