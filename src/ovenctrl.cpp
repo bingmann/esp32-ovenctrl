@@ -17,7 +17,7 @@ const char* wifi_ap_pass = "pizzaoven";
 const char* dnsName = "pizza";        // Domain name for the mDNS responder
 IPAddress wifi_ap_ip(192, 168, 4, 1); // The IP address of the access point
 
-static const bool g_ofen_simulator = true;
+static const bool g_ofen_simulator = false;
 
 /******************************************************************************/
 // ArduinoOTA
