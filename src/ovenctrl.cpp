@@ -198,14 +198,14 @@ volatile unsigned isr_last_ts = 0;
 const int max_temp = 900;
 
 static inline void on_target_temp_up(volatile unsigned& temp) {
-    if (temp + 20 < max_temp)
-        temp += 20;
+    if (temp + 10 < max_temp)
+        temp += 10;
     else
         temp = max_temp;
 }
 static inline void on_target_temp_down(volatile unsigned& temp) {
-    if (temp >= 20)
-        temp -= 20;
+    if (temp >= 10)
+        temp -= 10;
     else
         temp = 0;
 }
